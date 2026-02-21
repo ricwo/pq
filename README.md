@@ -212,6 +212,18 @@ pq.run_worker(pre_execute=setup_tracing, post_execute=flush_tracing)
 
 Hooks run in the forked child, making them safe for fork-unsafe resources like OpenTelemetry.
 
+## Logging
+
+pq uses [loguru](https://github.com/Delgan/loguru) internally and does **not** configure the logger on import. This means it inherits whatever logging setup the host application has already established.
+
+If you are running pq as a standalone script and want pq's default log format, call `configure_logging()` explicitly during startup:
+
+```python
+from pq.logging import configure_logging
+
+configure_logging()
+```
+
 ## Serialization
 
 Arguments are serialized automatically:

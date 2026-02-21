@@ -8,7 +8,10 @@ from loguru import logger
 def configure_logging() -> None:
     """Configure loguru with a clean, aligned format.
 
-    Called automatically when pq is imported.
+    This is an opt-in helper for applications that want pq's default log
+    format. Call it explicitly during application startup. pq itself never
+    calls this function so it will not interfere with an existing loguru
+    configuration.
     """
     # Remove default handler
     logger.remove()
@@ -21,7 +24,3 @@ def configure_logging() -> None:
         level="DEBUG",
         colorize=True,
     )
-
-
-# Auto-configure on import
-configure_logging()
