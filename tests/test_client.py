@@ -641,3 +641,151 @@ class TestUpsert:
         task_id = pq.upsert(dummy_handler, client_id="int-test")
         assert isinstance(task_id, int)
         assert task_id > 0
+
+
+class TestPendingAge:
+    """Tests for pending_age method."""
+
+    def test_no_pending_tasks(self, pq: PQ) -> None:
+        """Returns None when no pending tasks exist."""
+        assert pq.pending_age() is None
+
+    def test_returns_timedelta(self, pq: PQ) -> None:
+        """Returns a timedelta for a pending task that is ready to run."""
+        pq.enqueue(dummy_handler)
+
+        age = pq.pending_age()
+        assert isinstance(age, timedelta)
+        assert age.total_seconds() >= 0
+
+    def test_ignores_future_tasks(self, pq: PQ) -> None:
+        """Ignores pending tasks with run_at in the future."""
+        future = datetime.now(UTC) + timedelta(hours=1)
+        pq.enqueue(dummy_handler, run_at=future)
+
+        assert pq.pending_age() is None
+
+    def test_returns_oldest(self, pq: PQ) -> None:
+        """Returns age of the oldest ready task when multiple exist."""
+        from sqlalchemy import select, update
+
+        # Create two tasks, then backdate one
+        pq.enqueue(dummy_handler, client_id="old")
+        pq.enqueue(dummy_handler, client_id="new")
+
+        with pq.session() as session:
+            old_task = session.execute(
+                select(Task).where(Task.client_id == "old")
+            ).scalar_one()
+            session.execute(
+                update(Task)
+                .where(Task.id == old_task.id)
+                .values(run_at=datetime.now(UTC) - timedelta(minutes=10))
+            )
+
+        age = pq.pending_age()
+        assert age is not None
+        assert age.total_seconds() >= 600  # at least 10 minutes
+
+    def test_ignores_non_pending_tasks(self, pq: PQ) -> None:
+        """Ignores completed/running tasks."""
+        pq.enqueue(dummy_handler)
+        pq.run_worker_once()
+
+        assert pq.pending_age() is None
+
+
+class TestOverduePeriodicCount:
+    """Tests for overdue_periodic_count method."""
+
+    def test_no_periodic_tasks(self, pq: PQ) -> None:
+        """Returns 0 when no periodic tasks exist."""
+        assert pq.overdue_periodic_count() == 0
+
+    def test_counts_overdue(self, pq: PQ) -> None:
+        """Counts periodic tasks with next_run in the past."""
+        # schedule with run_every sets next_run = now, making it immediately overdue
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1))
+
+        assert pq.overdue_periodic_count() == 1
+
+    def test_ignores_inactive(self, pq: PQ) -> None:
+        """Ignores inactive periodic tasks even if overdue."""
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1), active=False)
+
+        assert pq.overdue_periodic_count() == 0
+
+    def test_ignores_future(self, pq: PQ) -> None:
+        """Ignores periodic tasks with next_run in the future."""
+        from sqlalchemy import select, update
+
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1))
+
+        with pq.session() as session:
+            periodic = session.execute(select(Periodic)).scalar_one()
+            session.execute(
+                update(Periodic)
+                .where(Periodic.id == periodic.id)
+                .values(next_run=datetime.now(UTC) + timedelta(hours=1))
+            )
+
+        assert pq.overdue_periodic_count() == 0
+
+
+class TestOverduePeriodicAge:
+    """Tests for overdue_periodic_age method."""
+
+    def test_no_periodic_tasks(self, pq: PQ) -> None:
+        """Returns None when no periodic tasks exist."""
+        assert pq.overdue_periodic_age() is None
+
+    def test_returns_timedelta(self, pq: PQ) -> None:
+        """Returns a timedelta for an overdue periodic task."""
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1))
+
+        age = pq.overdue_periodic_age()
+        assert isinstance(age, timedelta)
+        assert age.total_seconds() >= 0
+
+    def test_returns_oldest(self, pq: PQ) -> None:
+        """Returns age of the most overdue periodic task."""
+        from sqlalchemy import select, update
+
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1), key="old")
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1), key="new")
+
+        with pq.session() as session:
+            old_periodic = session.execute(
+                select(Periodic).where(Periodic.key == "old")
+            ).scalar_one()
+            session.execute(
+                update(Periodic)
+                .where(Periodic.id == old_periodic.id)
+                .values(next_run=datetime.now(UTC) - timedelta(minutes=30))
+            )
+
+        age = pq.overdue_periodic_age()
+        assert age is not None
+        assert age.total_seconds() >= 1800  # at least 30 minutes
+
+    def test_ignores_inactive(self, pq: PQ) -> None:
+        """Returns None when only inactive periodic tasks are overdue."""
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1), active=False)
+
+        assert pq.overdue_periodic_age() is None
+
+    def test_ignores_future(self, pq: PQ) -> None:
+        """Returns None when all periodic tasks have next_run in the future."""
+        from sqlalchemy import select, update
+
+        pq.schedule(cleanup_handler, run_every=timedelta(hours=1))
+
+        with pq.session() as session:
+            periodic = session.execute(select(Periodic)).scalar_one()
+            session.execute(
+                update(Periodic)
+                .where(Periodic.id == periodic.id)
+                .values(next_run=datetime.now(UTC) + timedelta(hours=1))
+            )
+
+        assert pq.overdue_periodic_age() is None

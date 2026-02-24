@@ -384,6 +384,36 @@ class PQ:
             result = session.execute(select(func.count()).select_from(Periodic))
             return result.scalar_one()
 
+    def pending_age(self) -> timedelta | None:
+        """Age of the oldest pending task that is ready to run."""
+        with self.session() as session:
+            result = session.execute(
+                select(func.now() - func.min(Task.run_at))
+                .select_from(Task)
+                .where(Task.status == TaskStatus.PENDING, Task.run_at <= func.now())
+            )
+            return result.scalar_one()
+
+    def overdue_periodic_count(self) -> int:
+        """Count active periodic tasks that are overdue."""
+        with self.session() as session:
+            result = session.execute(
+                select(func.count())
+                .select_from(Periodic)
+                .where(Periodic.active.is_(True), Periodic.next_run <= func.now())
+            )
+            return result.scalar_one()
+
+    def overdue_periodic_age(self) -> timedelta | None:
+        """Age of the most overdue periodic task, or None if none are overdue."""
+        with self.session() as session:
+            result = session.execute(
+                select(func.now() - func.min(Periodic.next_run))
+                .select_from(Periodic)
+                .where(Periodic.active.is_(True), Periodic.next_run <= func.now())
+            )
+            return result.scalar_one()
+
     def get_task(self, task_id: int) -> Task | None:
         """Get a task by ID.
 
