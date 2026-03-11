@@ -510,6 +510,7 @@ class PQ:
     def run_worker(
         self,
         *,
+        concurrency: int = 1,
         poll_interval: float = 1.0,
         max_runtime: float = 30 * 60,
         priorities: Set[Priority] | None = None,
@@ -519,6 +520,8 @@ class PQ:
         Each task executes in a forked child process for memory isolation.
 
         Args:
+            concurrency: Maximum number of tasks to process simultaneously.
+                Default: 1 (sequential processing).
             poll_interval: Seconds to sleep between polls when idle.
             max_runtime: Maximum execution time per task in seconds. Default: 30 min.
             priorities: If set, only process tasks with these priority levels.
@@ -528,6 +531,7 @@ class PQ:
 
         run_worker(
             self,
+            concurrency=concurrency,
             poll_interval=poll_interval,
             max_runtime=max_runtime,
             priorities=priorities,

@@ -9,12 +9,14 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import select as select_module
 import signal
 import sys
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 from croniter import croniter
 from loguru import logger
@@ -77,6 +79,27 @@ DEFAULT_CLEANUP_INTERVAL: float = 3600
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 EXIT_TIMEOUT = 124  # Like GNU timeout
+
+
+class _ChildResult(NamedTuple):
+    """Result from waiting for a forked child process."""
+
+    task_status: TaskStatus
+    error_msg: str | None
+    exit_kind: str  # "success", "timeout", "oom", "killed", "error"
+
+
+@dataclass
+class _ChildSlot:
+    """Tracks a running forked child in concurrent mode."""
+
+    pid: int
+    read_fd: int
+    task_id: int
+    name: str
+    start_time: float
+    is_periodic: bool
+    periodic_max_concurrent: int | None = None
 
 
 class WorkerError(Exception):
@@ -169,6 +192,107 @@ def _run_in_child(
         os._exit(EXIT_FAILURE)
 
 
+def _fork_child(
+    handler: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    max_runtime: float,
+    task: Task | Periodic,
+    pre_execute: PreExecuteHook | None = None,
+    post_execute: PostExecuteHook | None = None,
+) -> tuple[int, int]:
+    """Fork a child process to execute the handler.
+
+    Returns:
+        Tuple of (child_pid, read_fd) for monitoring the child.
+    """
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+
+    if child_pid == 0:
+        # === CHILD PROCESS ===
+        os.close(read_fd)
+        _run_in_child(
+            handler,
+            args,
+            kwargs,
+            max_runtime,
+            write_fd,
+            task,
+            pre_execute,
+            post_execute,
+        )
+        os._exit(EXIT_FAILURE)  # _run_in_child never returns, but just in case
+
+    # === PARENT PROCESS ===
+    os.close(write_fd)
+    return child_pid, read_fd
+
+
+def _wait_for_child(child_pid: int, read_fd: int) -> _ChildResult:
+    """Wait for a forked child process and return the result.
+
+    Args:
+        child_pid: PID of the child process.
+        read_fd: Read end of the error pipe.
+
+    Returns:
+        _ChildResult with task status, error message, and exit kind.
+    """
+    _, raw_status, rusage = os.wait4(child_pid, 0)
+
+    # Read error message from pipe
+    error_bytes = b""
+    try:
+        while True:
+            chunk = os.read(read_fd, 4096)
+            if not chunk:
+                break
+            error_bytes += chunk
+    except Exception:
+        pass
+    finally:
+        os.close(read_fd)
+
+    error_msg = error_bytes.decode("utf-8", errors="replace") if error_bytes else ""
+
+    if os.WIFSIGNALED(raw_status):
+        signal_num = os.WTERMSIG(raw_status)
+        if signal_num == signal.SIGKILL:
+            max_rss_kb = rusage.ru_maxrss
+            if sys.platform == "darwin":
+                max_rss_kb = max_rss_kb // 1024
+            return _ChildResult(
+                TaskStatus.FAILED,
+                f"Task killed (likely OOM). Max RSS: {max_rss_kb} KB",
+                "oom",
+            )
+        return _ChildResult(
+            TaskStatus.FAILED,
+            f"Task killed by signal {signal_num}",
+            "killed",
+        )
+
+    if os.WIFEXITED(raw_status):
+        exit_code = os.WEXITSTATUS(raw_status)
+        if exit_code == EXIT_SUCCESS:
+            return _ChildResult(TaskStatus.COMPLETED, None, "success")
+        if exit_code == EXIT_TIMEOUT:
+            return _ChildResult(
+                TaskStatus.FAILED, "Task exceeded max runtime", "timeout"
+            )
+        if error_msg:
+            return _ChildResult(TaskStatus.FAILED, error_msg.split("\n")[0], "error")
+        return _ChildResult(
+            TaskStatus.FAILED,
+            f"Task failed with exit code {exit_code}",
+            "error",
+        )
+
+    return _ChildResult(TaskStatus.FAILED, "Unknown child exit status", "error")
+
+
 def _execute_in_fork(
     handler: Callable[..., Any],
     args: tuple[Any, ...],
@@ -200,76 +324,26 @@ def _execute_in_fork(
         TaskKilledError: If task is killed by another signal.
         Exception: If task raises an exception.
     """
-    # Create pipe for error message communication
-    read_fd, write_fd = os.pipe()
+    child_pid, read_fd = _fork_child(
+        handler,
+        args,
+        kwargs,
+        max_runtime=max_runtime,
+        task=task,
+        pre_execute=pre_execute,
+        post_execute=post_execute,
+    )
+    result = _wait_for_child(child_pid, read_fd)
 
-    child_pid = os.fork()
-
-    if child_pid == 0:
-        # === CHILD PROCESS ===
-        os.close(read_fd)
-        _run_in_child(
-            handler,
-            args,
-            kwargs,
-            max_runtime,
-            write_fd,
-            task,
-            pre_execute,
-            post_execute,
-        )
-        # _run_in_child never returns, but just in case:
-        os._exit(EXIT_FAILURE)
-
-    else:
-        # === PARENT PROCESS ===
-        os.close(write_fd)
-
-        # Wait for child to finish
-        _, status, rusage = os.wait4(child_pid, 0)
-
-        # Read any error message from child
-        error_bytes = b""
-        try:
-            while True:
-                chunk = os.read(read_fd, 4096)
-                if not chunk:
-                    break
-                error_bytes += chunk
-        except Exception:
-            pass
-        finally:
-            os.close(read_fd)
-
-        error_msg = error_bytes.decode("utf-8", errors="replace") if error_bytes else ""
-
-        # Check how child exited
-        if os.WIFSIGNALED(status):
-            signal_num = os.WTERMSIG(status)
-            if signal_num == signal.SIGKILL:
-                # SIGKILL (9) often means OOM killer
-                # ru_maxrss is in KB on Linux, bytes on macOS
-                max_rss_kb = rusage.ru_maxrss
-                if sys.platform == "darwin":
-                    max_rss_kb = max_rss_kb // 1024
-                raise TaskOOMError(
-                    f"Task killed (likely OOM). Max RSS: {max_rss_kb} KB"
-                )
-            else:
-                raise TaskKilledError(f"Task killed by signal {signal_num}")
-
-        elif os.WIFEXITED(status):
-            exit_code = os.WEXITSTATUS(status)
-            if exit_code == EXIT_SUCCESS:
-                return  # Success!
-            elif exit_code == EXIT_TIMEOUT:
-                raise TaskTimeoutError("Task exceeded max runtime")
-            else:
-                # Task raised an exception
-                if error_msg:
-                    raise Exception(error_msg.split("\n")[0])  # First line
-                else:
-                    raise Exception(f"Task failed with exit code {exit_code}")
+    if result.exit_kind == "success":
+        return
+    if result.exit_kind == "timeout":
+        raise TaskTimeoutError(result.error_msg or "Task exceeded max runtime")
+    if result.exit_kind == "oom":
+        raise TaskOOMError(result.error_msg or "Task killed (likely OOM)")
+    if result.exit_kind == "killed":
+        raise TaskKilledError(result.error_msg or "Task killed by signal")
+    raise Exception(result.error_msg or "Task failed")
 
 
 def _maybe_run_cleanup(
@@ -306,6 +380,7 @@ def _maybe_run_cleanup(
 def run_worker(
     pq: PQ,
     *,
+    concurrency: int = 1,
     poll_interval: float = 1.0,
     max_runtime: float = DEFAULT_MAX_RUNTIME,
     priorities: Set[Priority] | None = None,
@@ -320,6 +395,8 @@ def run_worker(
 
     Args:
         pq: PQ client instance.
+        concurrency: Maximum number of tasks to process simultaneously.
+            Default: 1 (sequential processing).
         poll_interval: Seconds to sleep between polls when idle.
         max_runtime: Maximum execution time per task in seconds. Default: 30 min.
         priorities: If set, only process tasks with these priority levels.
@@ -334,9 +411,29 @@ def run_worker(
     """
     if priorities:
         priority_names = ", ".join(p.name for p in sorted(priorities, reverse=True))
-        logger.info(f"Starting PQ worker (priorities: {priority_names})...")
+        logger.info(
+            f"Starting PQ worker (priorities: {priority_names},"
+            f" concurrency: {concurrency})..."
+        )
     else:
-        logger.info("Starting PQ worker (fork isolation enabled)...")
+        logger.info(
+            f"Starting PQ worker (concurrency: {concurrency},"
+            " fork isolation enabled)..."
+        )
+
+    if concurrency > 1:
+        _run_concurrent(
+            pq,
+            concurrency=concurrency,
+            poll_interval=poll_interval,
+            max_runtime=max_runtime,
+            priorities=priorities,
+            pre_execute=pre_execute,
+            post_execute=post_execute,
+            retention_days=retention_days,
+            cleanup_interval=cleanup_interval,
+        )
+        return
 
     last_cleanup: list[float] = [0.0]  # Mutable container for tracking
 
@@ -653,3 +750,356 @@ def _process_periodic_task(
                 logger.error(f"Failed to clear lock for periodic task '{name}': {e}")
 
     return True
+
+
+# --- Concurrent worker functions ---
+
+
+def _claim_and_fork_one_off(
+    pq: PQ,
+    *,
+    max_runtime: float,
+    priorities: Set[Priority] | None = None,
+    pre_execute: PreExecuteHook | None = None,
+    post_execute: PostExecuteHook | None = None,
+) -> _ChildSlot | None:
+    """Claim a one-off task and fork a child to execute it.
+
+    Returns:
+        _ChildSlot if a task was claimed and forked, None if no tasks available.
+    """
+    try:
+        with pq.session() as session:
+            stmt = (
+                select(Task)
+                .where(Task.status == TaskStatus.PENDING)
+                .where(Task.run_at <= func.now())
+            )
+            if priorities:
+                stmt = stmt.where(Task.priority.in_([p.value for p in priorities]))
+            stmt = (
+                stmt.order_by(Task.priority.desc(), Task.run_at)
+                .with_for_update(skip_locked=True)
+                .limit(1)
+            )
+            task = session.execute(stmt).scalar_one_or_none()
+
+            if task is None:
+                return None
+
+            task.status = TaskStatus.RUNNING
+            task.started_at = datetime.now(UTC)
+            task.attempts += 1
+
+            name = task.name
+            payload = task.payload
+            task_id = task.id
+
+            session.flush()
+            session.expunge(task)
+
+    except Exception as e:
+        logger.error(f"Error claiming task: {e}")
+        return None
+
+    try:
+        handler = resolve_function_path(name)
+        args, kwargs = deserialize(payload)
+        child_pid, read_fd = _fork_child(
+            handler,
+            args,
+            kwargs,
+            max_runtime=max_runtime,
+            task=task,
+            pre_execute=pre_execute,
+            post_execute=post_execute,
+        )
+    except Exception as e:
+        logger.error(f"Error starting task '{name}': {e}")
+        try:
+            with pq.session() as session:
+                t = session.get(Task, task_id)
+                if t:
+                    t.status = TaskStatus.FAILED
+                    t.completed_at = datetime.now(UTC)
+                    t.error = str(e)
+        except Exception as update_err:
+            logger.error(f"Error updating task status: {update_err}")
+        return None
+
+    return _ChildSlot(
+        pid=child_pid,
+        read_fd=read_fd,
+        task_id=task_id,
+        name=name,
+        start_time=time.perf_counter(),
+        is_periodic=False,
+    )
+
+
+def _claim_and_fork_periodic(
+    pq: PQ,
+    *,
+    max_runtime: float,
+    priorities: Set[Priority] | None = None,
+    pre_execute: PreExecuteHook | None = None,
+    post_execute: PostExecuteHook | None = None,
+) -> _ChildSlot | None:
+    """Claim a periodic task and fork a child to execute it.
+
+    Returns:
+        _ChildSlot if a task was claimed and forked, None if no tasks available.
+    """
+    try:
+        with pq.session() as session:
+            stmt = select(Periodic).where(
+                Periodic.active.is_(True),
+                Periodic.next_run <= func.now(),
+                or_(
+                    Periodic.max_concurrent.is_(None),
+                    Periodic.locked_until.is_(None),
+                    Periodic.locked_until <= func.now(),
+                ),
+            )
+            if priorities:
+                stmt = stmt.where(Periodic.priority.in_([p.value for p in priorities]))
+            stmt = (
+                stmt.order_by(Periodic.priority.desc(), Periodic.next_run)
+                .with_for_update(skip_locked=True)
+                .limit(1)
+            )
+            periodic = session.execute(stmt).scalar_one_or_none()
+
+            if periodic is None:
+                return None
+
+            name = periodic.name
+            payload = periodic.payload
+            periodic_id = periodic.id
+            periodic_max_concurrent = periodic.max_concurrent
+
+            if periodic.max_concurrent is not None:
+                lock_duration = max_runtime if max_runtime > 0 else 3600
+                periodic.locked_until = func.now() + timedelta(seconds=lock_duration)
+
+            periodic.last_run = func.now()
+            if periodic.cron:
+                periodic.next_run = _calculate_next_run_cron(periodic.cron)
+            else:
+                periodic.next_run = func.now() + periodic.run_every
+
+            session.flush()
+            session.expunge(periodic)
+
+    except Exception as e:
+        logger.error(f"Error claiming periodic task: {e}")
+        return None
+
+    try:
+        handler = resolve_function_path(name)
+        args, kwargs = deserialize(payload)
+        child_pid, read_fd = _fork_child(
+            handler,
+            args,
+            kwargs,
+            max_runtime=max_runtime,
+            task=periodic,
+            pre_execute=pre_execute,
+            post_execute=post_execute,
+        )
+    except Exception as e:
+        logger.error(f"Error starting periodic task '{name}': {e}")
+        if periodic_max_concurrent is not None:
+            try:
+                with pq.session() as session:
+                    session.execute(
+                        update(Periodic)
+                        .where(Periodic.id == periodic_id)
+                        .values(locked_until=None)
+                    )
+            except Exception as lock_err:
+                logger.error(
+                    f"Failed to clear lock for periodic task '{name}': {lock_err}"
+                )
+        return None
+
+    return _ChildSlot(
+        pid=child_pid,
+        read_fd=read_fd,
+        task_id=periodic_id,
+        name=name,
+        start_time=time.perf_counter(),
+        is_periodic=True,
+        periodic_max_concurrent=periodic_max_concurrent,
+    )
+
+
+def _try_claim_and_fork(
+    pq: PQ,
+    *,
+    max_runtime: float,
+    priorities: Set[Priority] | None = None,
+    pre_execute: PreExecuteHook | None = None,
+    post_execute: PostExecuteHook | None = None,
+) -> _ChildSlot | None:
+    """Try to claim any available task (one-off first, then periodic) and fork.
+
+    Returns:
+        _ChildSlot if a task was claimed and forked, None if no tasks available.
+    """
+    slot = _claim_and_fork_one_off(
+        pq,
+        max_runtime=max_runtime,
+        priorities=priorities,
+        pre_execute=pre_execute,
+        post_execute=post_execute,
+    )
+    if slot is not None:
+        return slot
+
+    return _claim_and_fork_periodic(
+        pq,
+        max_runtime=max_runtime,
+        priorities=priorities,
+        pre_execute=pre_execute,
+        post_execute=post_execute,
+    )
+
+
+def _reap_and_update(pq: PQ, slot: _ChildSlot) -> None:
+    """Wait for a forked child to finish and update task status.
+
+    Args:
+        pq: PQ client instance.
+        slot: The child slot to reap.
+    """
+    result = _wait_for_child(slot.pid, slot.read_fd)
+    elapsed = time.perf_counter() - slot.start_time
+
+    if slot.is_periodic:
+        if result.exit_kind == "success":
+            logger.debug(f"Periodic task '{slot.name}' completed in {elapsed:.3f} s")
+        elif result.exit_kind == "timeout":
+            logger.error(f"Periodic task '{slot.name}' timed out after {elapsed:.3f} s")
+        elif result.exit_kind == "oom":
+            logger.error(
+                f"Periodic task '{slot.name}' OOM after {elapsed:.3f} s:"
+                f" {result.error_msg}"
+            )
+        elif result.exit_kind == "killed":
+            logger.error(
+                f"Periodic task '{slot.name}' killed after {elapsed:.3f} s:"
+                f" {result.error_msg}"
+            )
+        else:
+            logger.error(
+                f"Periodic task '{slot.name}' failed after {elapsed:.3f} s:"
+                f" {result.error_msg}"
+            )
+
+        if slot.periodic_max_concurrent is not None:
+            try:
+                with pq.session() as session:
+                    session.execute(
+                        update(Periodic)
+                        .where(Periodic.id == slot.task_id)
+                        .values(locked_until=None)
+                    )
+            except Exception as e:
+                logger.error(
+                    f"Failed to clear lock for periodic task '{slot.name}': {e}"
+                )
+    else:
+        error_msg = result.error_msg
+        if result.exit_kind == "timeout":
+            error_msg = f"Timed out after {elapsed:.3f} s"
+
+        try:
+            with pq.session() as session:
+                task = session.get(Task, slot.task_id)
+                if task:
+                    task.status = result.task_status
+                    task.completed_at = datetime.now(UTC)
+                    if error_msg:
+                        task.error = error_msg
+        except Exception as e:
+            logger.error(f"Error updating task status: {e}")
+
+        if result.task_status == TaskStatus.COMPLETED:
+            logger.debug(f"Task '{slot.name}' completed in {elapsed:.3f} s")
+        else:
+            logger.error(
+                f"Task '{slot.name}' failed after {elapsed:.3f} s: {error_msg}"
+            )
+
+
+def _run_concurrent(
+    pq: PQ,
+    *,
+    concurrency: int,
+    poll_interval: float,
+    max_runtime: float,
+    priorities: Set[Priority] | None,
+    pre_execute: PreExecuteHook | None,
+    post_execute: PostExecuteHook | None,
+    retention_days: int,
+    cleanup_interval: float,
+) -> None:
+    """Run the concurrent worker loop.
+
+    Manages up to ``concurrency`` forked children simultaneously using
+    select() on error pipes to detect child completion.
+
+    Args:
+        pq: PQ client instance.
+        concurrency: Maximum number of concurrent tasks.
+        poll_interval: Seconds between polls when idle.
+        max_runtime: Maximum execution time per task in seconds.
+        priorities: If set, only process tasks with these priority levels.
+        pre_execute: Called in forked child BEFORE task execution.
+        post_execute: Called in forked child AFTER task execution.
+        retention_days: Days to keep completed/failed tasks.
+        cleanup_interval: Seconds between cleanup runs.
+    """
+    children: dict[int, _ChildSlot] = {}  # pid -> slot
+    fd_to_pid: dict[int, int] = {}  # read_fd -> pid
+    last_cleanup: list[float] = [0.0]
+
+    try:
+        while True:
+            # Step 1: Fill empty slots with new tasks
+            while len(children) < concurrency:
+                slot = _try_claim_and_fork(
+                    pq,
+                    max_runtime=max_runtime,
+                    priorities=priorities,
+                    pre_execute=pre_execute,
+                    post_execute=post_execute,
+                )
+                if slot is None:
+                    break
+                children[slot.pid] = slot
+                fd_to_pid[slot.read_fd] = slot.pid
+
+            # Step 2: Wait for events
+            if children:
+                read_fds = list(fd_to_pid.keys())
+                ready, _, _ = select_module.select(read_fds, [], [], poll_interval)
+                for fd in ready:
+                    pid = fd_to_pid.pop(fd)
+                    slot = children.pop(pid)
+                    _reap_and_update(pq, slot)
+            else:
+                time.sleep(poll_interval)
+
+            # Cleanup runs on every iteration (rate-limited internally)
+            _maybe_run_cleanup(pq, retention_days, cleanup_interval, last_cleanup)
+
+    except KeyboardInterrupt:
+        if children:
+            logger.info(
+                f"Shutting down, waiting for {len(children)} task(s) to finish..."
+            )
+            for slot in list(children.values()):
+                _reap_and_update(pq, slot)
+        logger.info("Worker stopped.")

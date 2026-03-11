@@ -98,6 +98,12 @@ def slow_sync_handler() -> None:
     time.sleep(10)
 
 
+def sleep_handler(duration: float) -> None:
+    """Sleep for a given duration. Used in concurrency tests."""
+    time.sleep(duration)
+    _shared_results.append(1)
+
+
 class TestRunWorkerOnce:
     """Tests for run_worker_once method."""
 
@@ -742,3 +748,256 @@ class TestTaskTimeout:
 
         # Task should be removed (marked failed)
         assert pq.pending_count() == 0
+
+
+class TestConcurrentWorker:
+    """Tests for concurrent worker mode (concurrency > 1)."""
+
+    def test_parallel_execution(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Multiple tasks execute in parallel, not sequentially."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        # Enqueue 5 tasks that each sleep 1 second
+        for _ in range(5):
+            pq.enqueue(sleep_handler, duration=1.0)
+
+        from pq.worker import _run_concurrent
+
+        start = time.perf_counter()
+
+        import os
+        import signal as sig
+
+        pid = os.fork()
+        if pid == 0:
+            try:
+                _run_concurrent(
+                    pq,
+                    concurrency=5,
+                    poll_interval=0.1,
+                    max_runtime=30,
+                    priorities=None,
+                    pre_execute=None,
+                    post_execute=None,
+                    retention_days=0,
+                    cleanup_interval=3600,
+                )
+            except KeyboardInterrupt:
+                pass
+            os._exit(0)
+
+        # Parent: wait for tasks to complete, then stop worker
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            time.sleep(0.2)
+            if len(results) >= 5:
+                break
+
+        os.kill(pid, sig.SIGINT)
+        os.waitpid(pid, 0)
+
+        elapsed = time.perf_counter() - start
+        assert len(results) == 5
+        # Should complete in ~1-2s (parallel), not ~5s (sequential)
+        assert elapsed < 4.0
+
+    def test_slot_refill(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """When a task finishes, the freed slot picks up the next task."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        # Enqueue 6 tasks that each sleep 0.5 second
+        for _ in range(6):
+            pq.enqueue(sleep_handler, duration=0.5)
+
+        from pq.worker import _run_concurrent
+
+        import os
+        import signal as sig
+
+        start = time.perf_counter()
+
+        pid = os.fork()
+        if pid == 0:
+            try:
+                _run_concurrent(
+                    pq,
+                    concurrency=3,
+                    poll_interval=0.1,
+                    max_runtime=30,
+                    priorities=None,
+                    pre_execute=None,
+                    post_execute=None,
+                    retention_days=0,
+                    cleanup_interval=3600,
+                )
+            except KeyboardInterrupt:
+                pass
+            os._exit(0)
+
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            time.sleep(0.2)
+            if len(results) >= 6:
+                break
+
+        os.kill(pid, sig.SIGINT)
+        os.waitpid(pid, 0)
+
+        elapsed = time.perf_counter() - start
+        assert len(results) == 6
+        # 6 tasks, concurrency=3, 0.5s each → ~1s (2 batches), not 3s
+        assert elapsed < 3.0
+
+    def test_failed_task_concurrent(self, pq: PQ) -> None:
+        """Failed tasks are properly recorded in concurrent mode."""
+        pq.enqueue(failing_handler)
+
+        from pq.worker import _run_concurrent
+
+        import os
+        import signal as sig
+
+        pid = os.fork()
+        if pid == 0:
+            try:
+                _run_concurrent(
+                    pq,
+                    concurrency=3,
+                    poll_interval=0.1,
+                    max_runtime=30,
+                    priorities=None,
+                    pre_execute=None,
+                    post_execute=None,
+                    retention_days=0,
+                    cleanup_interval=3600,
+                )
+            except KeyboardInterrupt:
+                pass
+            os._exit(0)
+
+        # Wait for the task to be processed (poll instead of fixed sleep)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            time.sleep(0.2)
+            if pq.pending_count() == 0:
+                break
+
+        os.kill(pid, sig.SIGINT)
+        os.waitpid(pid, 0)
+
+        assert pq.pending_count() == 0
+        failed = pq.list_failed()
+        assert len(failed) == 1
+        assert "boom" in (failed[0].error or "")
+
+    def test_mixed_success_and_failure(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Concurrent worker handles mix of successful and failing tasks."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        pq.enqueue(capture_handler, value=1)
+        pq.enqueue(failing_handler)
+        pq.enqueue(capture_handler, value=2)
+
+        from pq.worker import _run_concurrent
+
+        import os
+        import signal as sig
+
+        pid = os.fork()
+        if pid == 0:
+            try:
+                _run_concurrent(
+                    pq,
+                    concurrency=3,
+                    poll_interval=0.1,
+                    max_runtime=30,
+                    priorities=None,
+                    pre_execute=None,
+                    post_execute=None,
+                    retention_days=0,
+                    cleanup_interval=3600,
+                )
+            except KeyboardInterrupt:
+                pass
+            os._exit(0)
+
+        # Wait for all tasks to be processed (poll instead of fixed sleep)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            time.sleep(0.2)
+            if pq.pending_count() == 0 and len(results) >= 2:
+                break
+
+        os.kill(pid, sig.SIGINT)
+        os.waitpid(pid, 0)
+
+        assert pq.pending_count() == 0
+        assert sorted(results) == [1, 2]
+        assert len(pq.list_failed()) == 1
+
+    def test_concurrent_periodic_task(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Periodic tasks are processed in concurrent mode."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        pq.schedule(periodic_handler, 42, run_every=timedelta(hours=1))
+
+        from pq.worker import _run_concurrent
+
+        import os
+        import signal as sig
+
+        pid = os.fork()
+        if pid == 0:
+            try:
+                _run_concurrent(
+                    pq,
+                    concurrency=3,
+                    poll_interval=0.1,
+                    max_runtime=30,
+                    priorities=None,
+                    pre_execute=None,
+                    post_execute=None,
+                    retention_days=0,
+                    cleanup_interval=3600,
+                )
+            except KeyboardInterrupt:
+                pass
+            os._exit(0)
+
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            time.sleep(0.2)
+            if len(results) >= 1:
+                break
+
+        os.kill(pid, sig.SIGINT)
+        os.waitpid(pid, 0)
+
+        assert list(results) == [42]
+
+    def test_concurrency_one_is_sequential(
+        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """concurrency=1 preserves existing sequential behavior."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        pq.enqueue(capture_handler, value=42)
+
+        from pq.worker import run_worker_once
+
+        processed = run_worker_once(pq)
+        assert processed is True
+        assert list(results) == [42]

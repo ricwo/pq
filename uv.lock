@@ -722,7 +722,7 @@ wheels = [
 
 [[package]]
 name = "python-pq"
-version = "0.5.2"
+version = "0.6.3"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
