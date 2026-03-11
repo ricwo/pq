@@ -1,6 +1,6 @@
 [project]
 name = "python-pq"
-version = "0.6.2"
+version = "0.6.3"
 description = "Postgres-backed job queue for Python"
 readme = "README.md"
 authors = [
