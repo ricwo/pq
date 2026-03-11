@@ -7,6 +7,7 @@ import asyncio
 import multiprocessing
 import multiprocessing.managers
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -753,153 +754,137 @@ class TestTaskTimeout:
 class TestConcurrentWorker:
     """Tests for concurrent worker mode (concurrency > 1)."""
 
-    def test_parallel_execution(
-        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+    def _run_concurrent_worker(
+        self,
+        db_url: str,
+        *,
+        concurrency: int = 3,
+        max_runtime: float = 30,
+        poll_interval: float = 0.1,
+    ) -> tuple[int, int]:
+        """Fork a child running _run_concurrent. Returns (child_pid, parent_pid).
+
+        Creates a fresh PQ instance in the child to avoid sharing
+        the parent's connection pool across fork.
+
+        Caller must eventually os.kill(pid, SIGINT) and os.waitpid(pid, 0).
+        """
+        import os
+
+        from pq.worker import _run_concurrent
+
+        pid = os.fork()
+        if pid == 0:
+            child_pq = PQ(db_url)
+            try:
+                _run_concurrent(
+                    child_pq,
+                    concurrency=concurrency,
+                    poll_interval=poll_interval,
+                    max_runtime=max_runtime,
+                    priorities=None,
+                    pre_execute=None,
+                    post_execute=None,
+                    retention_days=0,
+                    cleanup_interval=3600,
+                )
+            except KeyboardInterrupt:
+                pass
+            child_pq.close()
+            os._exit(0)
+
+        return pid, os.getpid()
+
+    def _wait_for(
+        self,
+        predicate: Callable[[], bool],
+        *,
+        timeout: float = 5,
+        poll: float = 0.1,
     ) -> None:
-        """Multiple tasks execute in parallel, not sequentially."""
+        """Poll until predicate returns True, or raise AssertionError."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return
+            time.sleep(poll)
+        raise AssertionError(f"Condition not met within {timeout}s")
+
+    def _stop_worker(self, pid: int) -> None:
+        """Send SIGINT and wait for the worker to exit."""
+        import os
+        import signal as sig
+
+        os.kill(pid, sig.SIGINT)
+        os.waitpid(pid, 0)
+
+    def test_parallel_execution(
+        self, pq: PQ, db_url: str, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """5 tasks sleeping 1s complete in ~1s with concurrency=5, not 5s."""
         results = manager.list()
         _set_shared_results(results)
 
-        # Enqueue 5 tasks that each sleep 1 second
         for _ in range(5):
             pq.enqueue(sleep_handler, duration=1.0)
 
-        from pq.worker import _run_concurrent
-
         start = time.perf_counter()
+        pid, _ = self._run_concurrent_worker(db_url, concurrency=5)
 
-        import os
-        import signal as sig
-
-        pid = os.fork()
-        if pid == 0:
-            try:
-                _run_concurrent(
-                    pq,
-                    concurrency=5,
-                    poll_interval=0.1,
-                    max_runtime=30,
-                    priorities=None,
-                    pre_execute=None,
-                    post_execute=None,
-                    retention_days=0,
-                    cleanup_interval=3600,
-                )
-            except KeyboardInterrupt:
-                pass
-            os._exit(0)
-
-        # Parent: wait for tasks to complete, then stop worker
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            time.sleep(0.2)
-            if len(results) >= 5:
-                break
-
-        os.kill(pid, sig.SIGINT)
-        os.waitpid(pid, 0)
+        self._wait_for(lambda: len(results) >= 5)
+        self._stop_worker(pid)
 
         elapsed = time.perf_counter() - start
+
         assert len(results) == 5
-        # Should complete in ~1-2s (parallel), not ~5s (sequential)
-        assert elapsed < 4.0
+        assert pq.pending_count() == 0
+        assert len(pq.list_completed()) == 5
+        assert elapsed < 2.5  # ~1s parallel + overhead, not 5s sequential
 
     def test_slot_refill(
-        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+        self, pq: PQ, db_url: str, manager: multiprocessing.managers.SyncManager
     ) -> None:
-        """When a task finishes, the freed slot picks up the next task."""
+        """6 tasks with concurrency=3 run in 2 batches (~1s), not 6 sequential."""
         results = manager.list()
         _set_shared_results(results)
 
-        # Enqueue 6 tasks that each sleep 0.5 second
         for _ in range(6):
             pq.enqueue(sleep_handler, duration=0.5)
 
-        from pq.worker import _run_concurrent
-
-        import os
-        import signal as sig
-
         start = time.perf_counter()
+        pid, _ = self._run_concurrent_worker(db_url, concurrency=3)
 
-        pid = os.fork()
-        if pid == 0:
-            try:
-                _run_concurrent(
-                    pq,
-                    concurrency=3,
-                    poll_interval=0.1,
-                    max_runtime=30,
-                    priorities=None,
-                    pre_execute=None,
-                    post_execute=None,
-                    retention_days=0,
-                    cleanup_interval=3600,
-                )
-            except KeyboardInterrupt:
-                pass
-            os._exit(0)
-
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            time.sleep(0.2)
-            if len(results) >= 6:
-                break
-
-        os.kill(pid, sig.SIGINT)
-        os.waitpid(pid, 0)
+        self._wait_for(lambda: len(results) >= 6)
+        self._stop_worker(pid)
 
         elapsed = time.perf_counter() - start
-        assert len(results) == 6
-        # 6 tasks, concurrency=3, 0.5s each → ~1s (2 batches), not 3s
-        assert elapsed < 3.0
 
-    def test_failed_task_concurrent(self, pq: PQ) -> None:
-        """Failed tasks are properly recorded in concurrent mode."""
+        assert len(results) == 6
+        assert pq.pending_count() == 0
+        assert len(pq.list_completed()) == 6
+        assert elapsed < 2.0  # 2 batches × 0.5s + overhead
+
+    def test_failed_task_concurrent(self, pq: PQ, db_url: str) -> None:
+        """Failed tasks have correct status, error type, and error message."""
         pq.enqueue(failing_handler)
 
-        from pq.worker import _run_concurrent
+        pid, _ = self._run_concurrent_worker(db_url)
 
-        import os
-        import signal as sig
-
-        pid = os.fork()
-        if pid == 0:
-            try:
-                _run_concurrent(
-                    pq,
-                    concurrency=3,
-                    poll_interval=0.1,
-                    max_runtime=30,
-                    priorities=None,
-                    pre_execute=None,
-                    post_execute=None,
-                    retention_days=0,
-                    cleanup_interval=3600,
-                )
-            except KeyboardInterrupt:
-                pass
-            os._exit(0)
-
-        # Wait for the task to be processed (poll instead of fixed sleep)
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            time.sleep(0.2)
-            if pq.pending_count() == 0:
-                break
-
-        os.kill(pid, sig.SIGINT)
-        os.waitpid(pid, 0)
+        self._wait_for(lambda: pq.pending_count() == 0)
+        self._stop_worker(pid)
 
         assert pq.pending_count() == 0
         failed = pq.list_failed()
         assert len(failed) == 1
+        assert failed[0].status.value == "failed"
+        assert "ValueError" in (failed[0].error or "")
         assert "boom" in (failed[0].error or "")
+        assert failed[0].completed_at is not None
 
     def test_mixed_success_and_failure(
-        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+        self, pq: PQ, db_url: str, manager: multiprocessing.managers.SyncManager
     ) -> None:
-        """Concurrent worker handles mix of successful and failing tasks."""
+        """Successful and failing tasks are tracked independently."""
         results = manager.list()
         _set_shared_results(results)
 
@@ -907,45 +892,18 @@ class TestConcurrentWorker:
         pq.enqueue(failing_handler)
         pq.enqueue(capture_handler, value=2)
 
-        from pq.worker import _run_concurrent
+        pid, _ = self._run_concurrent_worker(db_url, concurrency=3)
 
-        import os
-        import signal as sig
-
-        pid = os.fork()
-        if pid == 0:
-            try:
-                _run_concurrent(
-                    pq,
-                    concurrency=3,
-                    poll_interval=0.1,
-                    max_runtime=30,
-                    priorities=None,
-                    pre_execute=None,
-                    post_execute=None,
-                    retention_days=0,
-                    cleanup_interval=3600,
-                )
-            except KeyboardInterrupt:
-                pass
-            os._exit(0)
-
-        # Wait for all tasks to be processed (poll instead of fixed sleep)
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            time.sleep(0.2)
-            if pq.pending_count() == 0 and len(results) >= 2:
-                break
-
-        os.kill(pid, sig.SIGINT)
-        os.waitpid(pid, 0)
+        self._wait_for(lambda: pq.pending_count() == 0 and len(results) >= 2)
+        self._stop_worker(pid)
 
         assert pq.pending_count() == 0
         assert sorted(results) == [1, 2]
+        assert len(pq.list_completed()) == 2
         assert len(pq.list_failed()) == 1
 
     def test_concurrent_periodic_task(
-        self, pq: PQ, manager: multiprocessing.managers.SyncManager
+        self, pq: PQ, db_url: str, manager: multiprocessing.managers.SyncManager
     ) -> None:
         """Periodic tasks are processed in concurrent mode."""
         results = manager.list()
@@ -953,37 +911,10 @@ class TestConcurrentWorker:
 
         pq.schedule(periodic_handler, 42, run_every=timedelta(hours=1))
 
-        from pq.worker import _run_concurrent
+        pid, _ = self._run_concurrent_worker(db_url)
 
-        import os
-        import signal as sig
-
-        pid = os.fork()
-        if pid == 0:
-            try:
-                _run_concurrent(
-                    pq,
-                    concurrency=3,
-                    poll_interval=0.1,
-                    max_runtime=30,
-                    priorities=None,
-                    pre_execute=None,
-                    post_execute=None,
-                    retention_days=0,
-                    cleanup_interval=3600,
-                )
-            except KeyboardInterrupt:
-                pass
-            os._exit(0)
-
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            time.sleep(0.2)
-            if len(results) >= 1:
-                break
-
-        os.kill(pid, sig.SIGINT)
-        os.waitpid(pid, 0)
+        self._wait_for(lambda: len(results) >= 1)
+        self._stop_worker(pid)
 
         assert list(results) == [42]
 
@@ -1001,3 +932,4 @@ class TestConcurrentWorker:
         processed = run_worker_once(pq)
         assert processed is True
         assert list(results) == [42]
+        assert len(pq.list_completed()) == 1

@@ -13,9 +13,14 @@ from pq.client import PQ
 @pytest.fixture
 def db_url() -> str:
     """Database URL for tests."""
-    return os.environ.get(
+    url = os.environ.get(
         "PQ_DATABASE_URL", "postgresql://postgres:postgres@localhost:5433/postgres"
     )
+    # Disable GSSAPI to prevent segfaults when forking (psycopg2-binary bundles
+    # libkrb5/libgssapi whose internal state corrupts across os.fork).
+    if "gssencmode" not in url:
+        url += "&gssencmode=disable" if "?" in url else "?gssencmode=disable"
+    return url
 
 
 @pytest.fixture
