@@ -283,7 +283,7 @@ def _wait_for_child(child_pid: int, read_fd: int) -> _ChildResult:
                 TaskStatus.FAILED, "Task exceeded max runtime", "timeout"
             )
         if error_msg:
-            return _ChildResult(TaskStatus.FAILED, error_msg.split("\n")[0], "error")
+            return _ChildResult(TaskStatus.FAILED, error_msg.rstrip(), "error")
         return _ChildResult(
             TaskStatus.FAILED,
             f"Task failed with exit code {exit_code}",
