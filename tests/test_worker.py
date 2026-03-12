@@ -831,7 +831,9 @@ class TestConcurrentWorker:
         start = time.perf_counter()
         pid, _ = self._run_concurrent_worker(db_url, concurrency=5)
 
-        self._wait_for(lambda: len(results) >= 5)
+        # Wait for DB state (not just handler results) to avoid race between
+        # handler completion and worker reaping/updating the DB.
+        self._wait_for(lambda: len(pq.list_completed()) >= 5)
         self._stop_worker(pid)
 
         elapsed = time.perf_counter() - start
@@ -854,7 +856,7 @@ class TestConcurrentWorker:
         start = time.perf_counter()
         pid, _ = self._run_concurrent_worker(db_url, concurrency=3)
 
-        self._wait_for(lambda: len(results) >= 6)
+        self._wait_for(lambda: len(pq.list_completed()) >= 6)
         self._stop_worker(pid)
 
         elapsed = time.perf_counter() - start
@@ -870,7 +872,7 @@ class TestConcurrentWorker:
 
         pid, _ = self._run_concurrent_worker(db_url)
 
-        self._wait_for(lambda: pq.pending_count() == 0)
+        self._wait_for(lambda: len(pq.list_failed()) >= 1)
         self._stop_worker(pid)
 
         assert pq.pending_count() == 0
@@ -894,7 +896,9 @@ class TestConcurrentWorker:
 
         pid, _ = self._run_concurrent_worker(db_url, concurrency=3)
 
-        self._wait_for(lambda: pq.pending_count() == 0 and len(results) >= 2)
+        self._wait_for(
+            lambda: len(pq.list_completed()) >= 2 and len(pq.list_failed()) >= 1
+        )
         self._stop_worker(pid)
 
         assert pq.pending_count() == 0
@@ -917,6 +921,183 @@ class TestConcurrentWorker:
         self._stop_worker(pid)
 
         assert list(results) == [42]
+
+    def test_graceful_shutdown_completes_in_flight(
+        self, pq: PQ, db_url: str, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """SIGINT during execution waits for in-flight tasks to complete."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        for _ in range(3):
+            pq.enqueue(sleep_handler, duration=1.5)
+
+        pid, _ = self._run_concurrent_worker(db_url, concurrency=3)
+
+        # Wait for tasks to start but not finish
+        time.sleep(0.5)
+
+        # SIGINT — worker should wait for in-flight tasks before exiting
+        self._stop_worker(pid)
+
+        # All 3 should have completed (worker waited for them)
+        assert len(results) == 3
+        assert pq.pending_count() == 0
+        assert len(pq.list_completed()) == 3
+
+    def test_timeout_concurrent(self, pq: PQ, db_url: str) -> None:
+        """Task exceeding max_runtime is killed and marked failed."""
+        pq.enqueue(slow_sync_handler)  # sleeps 10s
+
+        pid, _ = self._run_concurrent_worker(db_url, max_runtime=1)
+
+        self._wait_for(lambda: len(pq.list_failed()) >= 1, timeout=10)
+        self._stop_worker(pid)
+
+        failed = pq.list_failed()
+        assert len(failed) == 1
+        assert "Timed out" in (failed[0].error or "")
+        assert failed[0].completed_at is not None
+
+    def test_priority_ordering_concurrent(
+        self, pq: PQ, db_url: str, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Higher priority tasks are claimed first in concurrent mode."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        # Enqueue in reverse priority order
+        pq.enqueue(ordered_handler, n=3, priority=Priority.LOW)
+        pq.enqueue(ordered_handler, n=1, priority=Priority.HIGH)
+        pq.enqueue(ordered_handler, n=2, priority=Priority.NORMAL)
+
+        # concurrency=1 forces sequential claiming within the concurrent loop
+        pid, _ = self._run_concurrent_worker(db_url, concurrency=1)
+
+        self._wait_for(lambda: len(pq.list_completed()) >= 3)
+        self._stop_worker(pid)
+
+        assert list(results) == [1, 2, 3]
+
+    def test_mixed_one_off_and_periodic_concurrent(
+        self, pq: PQ, db_url: str, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """One-off and periodic tasks are processed together."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        pq.enqueue(capture_handler, value="one-off")
+        pq.schedule(periodic_handler, 42, run_every=timedelta(hours=1))
+
+        pid, _ = self._run_concurrent_worker(db_url, concurrency=3)
+
+        self._wait_for(lambda: len(results) >= 2)
+        self._stop_worker(pid)
+
+        assert "one-off" in list(results)
+        assert 42 in list(results)
+        assert len(pq.list_completed()) == 1  # one-off tracked in tasks table
+
+    def test_failed_periodic_concurrent(self, pq: PQ, db_url: str) -> None:
+        """Failed periodic tasks clear lock and advance schedule in concurrent mode."""
+        from sqlalchemy import select as sa_select
+
+        pq.schedule(failing_handler, run_every=timedelta(hours=1))
+
+        pid, _ = self._run_concurrent_worker(db_url)
+
+        # Wait for the periodic task to be processed (schedule advances)
+        self._wait_for(
+            lambda: self._periodic_was_run(pq, "tests.test_worker:failing_handler")
+        )
+        self._stop_worker(pid)
+
+        # Verify lock is cleared and schedule is advanced
+        with pq.session() as session:
+            periodic = session.execute(
+                sa_select(Periodic).where(
+                    Periodic.name == "tests.test_worker:failing_handler"
+                )
+            ).scalar_one()
+            assert periodic.locked_until is None  # lock cleared
+            assert periodic.last_run is not None  # was run
+
+    def test_priority_filter_concurrent(
+        self, pq: PQ, db_url: str, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Priority filter restricts which tasks are claimed in concurrent mode."""
+        results = manager.list()
+        _set_shared_results(results)
+
+        pq.enqueue(ordered_handler, n=1, priority=Priority.HIGH)
+        pq.enqueue(ordered_handler, n=2, priority=Priority.NORMAL)
+        pq.enqueue(ordered_handler, n=3, priority=Priority.LOW)
+
+        from pq.worker import _run_concurrent
+
+        import os
+        import signal as sig
+
+        pid = os.fork()
+        if pid == 0:
+            child_pq = PQ(db_url)
+            try:
+                _run_concurrent(
+                    child_pq,
+                    concurrency=3,
+                    poll_interval=0.1,
+                    max_runtime=30,
+                    priorities={Priority.HIGH},
+                    pre_execute=None,
+                    post_execute=None,
+                    retention_days=0,
+                    cleanup_interval=3600,
+                )
+            except KeyboardInterrupt:
+                pass
+            child_pq.close()
+            os._exit(0)
+
+        self._wait_for(lambda: len(pq.list_completed()) >= 1)
+        # Give it time to potentially pick up more tasks (it shouldn't)
+        time.sleep(0.3)
+        os.kill(pid, sig.SIGINT)
+        os.waitpid(pid, 0)
+
+        assert list(results) == [1]  # only HIGH
+        assert len(pq.list_completed()) == 1
+        assert pq.pending_count() == 2  # NORMAL and LOW still pending
+
+    def _periodic_was_run(self, pq: PQ, name: str) -> bool:
+        """Check if a periodic task's last_run was set."""
+        from sqlalchemy import select as sa_select
+
+        with pq.session() as session:
+            periodic = session.execute(
+                sa_select(Periodic).where(Periodic.name == name)
+            ).scalar_one_or_none()
+            return periodic is not None and periodic.last_run is not None
+
+    def test_future_task_not_claimed_concurrent(self, pq: PQ, db_url: str) -> None:
+        """Tasks with run_at in the future are not picked up."""
+        future = datetime.now(UTC) + timedelta(hours=1)
+        pq.enqueue(noop_handler, run_at=future)
+
+        pid, _ = self._run_concurrent_worker(db_url)
+
+        time.sleep(0.5)
+        self._stop_worker(pid)
+
+        assert pq.pending_count() == 1  # still waiting
+
+    def test_empty_queue_concurrent(self, pq: PQ, db_url: str) -> None:
+        """Worker idles on empty queue without errors."""
+        pid, _ = self._run_concurrent_worker(db_url)
+
+        time.sleep(0.5)
+        self._stop_worker(pid)
+
+        assert pq.pending_count() == 0
 
     def test_concurrency_one_is_sequential(
         self, pq: PQ, manager: multiprocessing.managers.SyncManager
