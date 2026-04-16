@@ -1114,3 +1114,62 @@ class TestConcurrentWorker:
         assert processed is True
         assert list(results) == [42]
         assert len(pq.list_completed()) == 1
+
+
+class TestStaleReaperRace:
+    """Tests for the Phase 3 race between worker status update and reaper."""
+
+    def test_worker_does_not_overwrite_reaped_task(self, pq: PQ) -> None:
+        """If the reaper marks a task FAILED while the worker is alive,
+        the worker's Phase 3 update must not overwrite it back to COMPLETED.
+
+        Simulates: task is claimed -> reaper fires -> worker finishes fork.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        from sqlalchemy import update as sa_update
+
+        from pq.models import Task, TaskStatus
+
+        # Enqueue and let the worker claim + execute it
+        task_id = pq.enqueue(noop_handler, client_id="race-test")
+
+        # Manually simulate the race:
+        # 1. Set task to RUNNING (as if worker claimed it)
+        with pq.session() as session:
+            session.execute(
+                sa_update(Task)
+                .where(Task.id == task_id)
+                .values(
+                    status=TaskStatus.RUNNING,
+                    started_at=datetime.now(UTC) - timedelta(hours=2),
+                )
+            )
+
+        # 2. Reaper fires and marks it FAILED
+        reaped = pq.reap_stale_tasks(timedelta(hours=1))
+        assert reaped == 1
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.FAILED
+        assert "Reaped" in (task.error or "")
+
+        # 3. Now simulate what Phase 3 does: try to update WHERE status = RUNNING
+        #    This should be a no-op because status is already FAILED
+        with pq.session() as session:
+            result = session.execute(
+                sa_update(Task)
+                .where(Task.id == task_id, Task.status == TaskStatus.RUNNING)
+                .values(
+                    status=TaskStatus.COMPLETED,
+                    completed_at=datetime.now(UTC),
+                )
+            )
+            assert result.rowcount == 0  # No rows updated
+
+        # Task should still be FAILED with the reaper's error message
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.FAILED
+        assert "Reaped" in (task.error or "")
