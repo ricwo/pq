@@ -75,6 +75,10 @@ DEFAULT_RETENTION_DAYS: int = 7
 # Default cleanup interval: 1 hour
 DEFAULT_CLEANUP_INTERVAL: float = 3600
 
+# Default stale task timeout: 1 hour
+# Tasks RUNNING longer than this are assumed orphaned (worker died) and reaped.
+DEFAULT_STALE_TASK_TIMEOUT: timedelta = timedelta(hours=1)
+
 # Exit codes for child process
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
@@ -351,28 +355,38 @@ def _maybe_run_cleanup(
     retention_days: int,
     cleanup_interval: float,
     last_cleanup: list[float],
+    stale_task_timeout: timedelta | None = None,
 ) -> None:
     """Run cleanup if retention is enabled and interval has passed.
+
+    Also reaps stale RUNNING tasks if ``stale_task_timeout`` is set.
 
     Args:
         pq: PQ client instance.
         retention_days: Days to keep completed/failed tasks. 0 to disable.
         cleanup_interval: Seconds between cleanup runs.
         last_cleanup: Mutable list containing last cleanup timestamp.
+        stale_task_timeout: If set, RUNNING tasks older than this are
+            marked FAILED. Pass ``None`` to disable reaping.
     """
-    if retention_days <= 0:
-        return
-
     now = time.time()
     if now - last_cleanup[0] < cleanup_interval:
         return
 
-    cutoff = datetime.now(UTC) - timedelta(days=retention_days)
-    completed = pq.clear_completed(before=cutoff)
-    failed = pq.clear_failed(before=cutoff)
+    if retention_days > 0:
+        cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+        completed = pq.clear_completed(before=cutoff)
+        failed = pq.clear_failed(before=cutoff)
 
-    if completed or failed:
-        logger.info(f"Cleanup: removed {completed} completed, {failed} failed tasks")
+        if completed or failed:
+            logger.info(
+                f"Cleanup: removed {completed} completed, {failed} failed tasks"
+            )
+
+    if stale_task_timeout is not None:
+        reaped = pq.reap_stale_tasks(stale_task_timeout)
+        if reaped:
+            logger.info(f"Cleanup: reaped {reaped} stale RUNNING task(s)")
 
     last_cleanup[0] = now
 
@@ -386,6 +400,7 @@ def run_worker(
     priorities: Set[Priority] | None = None,
     retention_days: int = DEFAULT_RETENTION_DAYS,
     cleanup_interval: float = DEFAULT_CLEANUP_INTERVAL,
+    stale_task_timeout: timedelta | None = DEFAULT_STALE_TASK_TIMEOUT,
     pre_execute: PreExecuteHook | None = None,
     post_execute: PostExecuteHook | None = None,
 ) -> None:
@@ -404,6 +419,9 @@ def run_worker(
         retention_days: Days to keep completed/failed tasks. Default: 7.
             Set to 0 to disable automatic cleanup.
         cleanup_interval: Seconds between cleanup runs. Default: 3600 (1 hour).
+        stale_task_timeout: Mark RUNNING tasks older than this as FAILED.
+            Catches orphaned tasks whose worker died mid-execution.
+            Default: 1 hour. Set to ``None`` to disable.
         pre_execute: Called in forked child BEFORE task execution.
             Use for initializing fork-unsafe resources (OTel, DB connections).
         post_execute: Called in forked child AFTER task execution (success or failure).
@@ -432,6 +450,7 @@ def run_worker(
             post_execute=post_execute,
             retention_days=retention_days,
             cleanup_interval=cleanup_interval,
+            stale_task_timeout=stale_task_timeout,
         )
         return
 
@@ -446,7 +465,13 @@ def run_worker(
                 pre_execute=pre_execute,
                 post_execute=post_execute,
             ):
-                _maybe_run_cleanup(pq, retention_days, cleanup_interval, last_cleanup)
+                _maybe_run_cleanup(
+                    pq,
+                    retention_days,
+                    cleanup_interval,
+                    last_cleanup,
+                    stale_task_timeout=stale_task_timeout,
+                )
                 time.sleep(poll_interval)
     except KeyboardInterrupt:
         logger.info("Worker stopped.")
@@ -1044,6 +1069,7 @@ def _run_concurrent(
     post_execute: PostExecuteHook | None,
     retention_days: int,
     cleanup_interval: float,
+    stale_task_timeout: timedelta | None = None,
 ) -> None:
     """Run the concurrent worker loop.
 
@@ -1060,6 +1086,7 @@ def _run_concurrent(
         post_execute: Called in forked child AFTER task execution.
         retention_days: Days to keep completed/failed tasks.
         cleanup_interval: Seconds between cleanup runs.
+        stale_task_timeout: If set, reap RUNNING tasks older than this.
     """
     children: dict[int, _ChildSlot] = {}  # pid -> slot
     fd_to_pid: dict[int, int] = {}  # read_fd -> pid
@@ -1093,7 +1120,13 @@ def _run_concurrent(
                 time.sleep(poll_interval)
 
             # Cleanup runs on every iteration (rate-limited internally)
-            _maybe_run_cleanup(pq, retention_days, cleanup_interval, last_cleanup)
+            _maybe_run_cleanup(
+                pq,
+                retention_days,
+                cleanup_interval,
+                last_cleanup,
+                stale_task_timeout=stale_task_timeout,
+            )
 
     except KeyboardInterrupt:
         if children:

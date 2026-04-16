@@ -9,6 +9,7 @@ from typing import Any, Self
 
 from croniter import croniter
 from croniter.croniter import CroniterBadCronError
+from loguru import logger
 from sqlalchemy import create_engine, delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
@@ -506,6 +507,48 @@ class PQ:
                 stmt = stmt.where(Task.completed_at < before)
             result = session.execute(stmt)
             return result.rowcount
+
+    def reap_stale_tasks(self, threshold: timedelta) -> int:
+        """Mark stale RUNNING tasks as FAILED.
+
+        When a worker dies mid-execution (e.g. pod restart, OOM on the worker
+        process), in-flight tasks stay RUNNING forever because no parent
+        process remains to update their status. This method detects those
+        orphaned rows and transitions them to FAILED.
+
+        Args:
+            threshold: A task is considered stale when
+                ``started_at + threshold < now()``. Should be set safely
+                above ``max_runtime`` to avoid reaping legitimately running
+                tasks (e.g. ``timedelta(seconds=max_runtime * 2)``).
+
+        Returns:
+            Number of tasks reaped.
+        """
+        cutoff = datetime.now(UTC) - threshold
+        with self.session() as session:
+            stmt = (
+                select(Task)
+                .where(
+                    Task.status == TaskStatus.RUNNING,
+                    Task.started_at < cutoff,
+                )
+                .with_for_update(skip_locked=True)
+            )
+            stale_tasks = list(session.execute(stmt).scalars().all())
+            for task in stale_tasks:
+                task.status = TaskStatus.FAILED
+                task.completed_at = datetime.now(UTC)
+                task.error = (
+                    f"Reaped: task still RUNNING after {threshold} "
+                    f"(started at {task.started_at.isoformat()}). "
+                    f"Worker likely died."
+                )
+                logger.warning(
+                    f"Reaped stale task '{task.name}' (id={task.id},"
+                    f" started_at={task.started_at})"
+                )
+            return len(stale_tasks)
 
     def run_worker(
         self,
