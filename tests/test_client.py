@@ -716,17 +716,34 @@ class TestReapStaleTasks:
         assert task is not None
         assert task.status == TaskStatus.RUNNING
 
-    def test_does_not_reap_pending_or_completed_tasks(self, pq: PQ) -> None:
-        """Only RUNNING tasks are reaped, not PENDING/COMPLETED/FAILED."""
-        # Enqueue two tasks (both start as PENDING)
-        pq.enqueue(dummy_handler, client_id="task-a")
-        pq.enqueue(dummy_handler, client_id="task-b")
+    def test_does_not_reap_non_running_tasks(self, pq: PQ) -> None:
+        """Only RUNNING tasks are reaped — PENDING, COMPLETED, and FAILED are untouched."""
+        from sqlalchemy import update as sa_update
 
-        # Process one — task-a becomes COMPLETED, task-b stays PENDING
+        from pq.models import TaskStatus
+
+        # PENDING
+        pq.enqueue(dummy_handler, client_id="task-pending")
+
+        # COMPLETED (enqueue + process)
+        pq.enqueue(dummy_handler, client_id="task-completed")
         pq.run_worker_once()
 
-        # threshold=0 means "reap anything RUNNING at all" — but nothing is RUNNING
-        reaped = pq.reap_stale_tasks(timedelta(seconds=0))
+        # FAILED (manually set — simulates a previously failed task)
+        failed_id = pq.enqueue(dummy_handler, client_id="task-failed")
+        with pq.session() as session:
+            session.execute(
+                sa_update(Task)
+                .where(Task.id == failed_id)
+                .values(
+                    status=TaskStatus.FAILED,
+                    started_at=datetime.now(UTC) - timedelta(hours=2),
+                    completed_at=datetime.now(UTC) - timedelta(hours=2),
+                    error="original failure",
+                )
+            )
+
+        reaped = pq.reap_stale_tasks(timedelta(hours=1))
 
         assert reaped == 0
 

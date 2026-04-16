@@ -10,7 +10,7 @@ from typing import Any, Self
 from croniter import croniter
 from croniter.croniter import CroniterBadCronError
 from loguru import logger
-from sqlalchemy import create_engine, delete, func, select
+from sqlalchemy import create_engine, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
@@ -518,37 +518,39 @@ class PQ:
 
         Args:
             threshold: A task is considered stale when
-                ``started_at + threshold < now()``. Should be set safely
-                above ``max_runtime`` to avoid reaping legitimately running
-                tasks (e.g. ``timedelta(seconds=max_runtime * 2)``).
+                ``started_at + threshold < now()``. Should be at least
+                2x ``max_runtime`` to avoid reaping legitimately running
+                tasks, e.g. ``timedelta(seconds=max_runtime * 2)``.
 
         Returns:
             Number of tasks reaped.
         """
-        cutoff = datetime.now(UTC) - threshold
+        now = datetime.now(UTC)
+        cutoff = now - threshold
         with self.session() as session:
             stmt = (
-                select(Task)
+                update(Task)
                 .where(
                     Task.status == TaskStatus.RUNNING,
                     Task.started_at < cutoff,
                 )
-                .with_for_update(skip_locked=True)
+                .values(
+                    status=TaskStatus.FAILED,
+                    completed_at=now,
+                    error=(
+                        f"Reaped: task still RUNNING after {threshold} "
+                        f"(cutoff={cutoff.isoformat()}). Worker likely died."
+                    ),
+                )
+                .returning(Task.id, Task.name, Task.started_at)
             )
-            stale_tasks = list(session.execute(stmt).scalars().all())
-            for task in stale_tasks:
-                task.status = TaskStatus.FAILED
-                task.completed_at = datetime.now(UTC)
-                task.error = (
-                    f"Reaped: task still RUNNING after {threshold} "
-                    f"(started at {task.started_at.isoformat()}). "
-                    f"Worker likely died."
-                )
+            reaped = list(session.execute(stmt).all())
+            for task_id, name, started_at in reaped:
                 logger.warning(
-                    f"Reaped stale task '{task.name}' (id={task.id},"
-                    f" started_at={task.started_at})"
+                    f"Reaped stale task '{name}' (id={task_id},"
+                    f" started_at={started_at})"
                 )
-            return len(stale_tasks)
+            return len(reaped)
 
     def run_worker(
         self,

@@ -79,6 +79,10 @@ DEFAULT_CLEANUP_INTERVAL: float = 3600
 # Tasks RUNNING longer than this are assumed orphaned (worker died) and reaped.
 DEFAULT_STALE_TASK_TIMEOUT: timedelta = timedelta(hours=1)
 
+# Default reaper check interval: 5 minutes
+# How often the worker checks for stale RUNNING tasks.
+DEFAULT_REAPER_INTERVAL: float = 300
+
 # Exit codes for child process
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
@@ -355,40 +359,59 @@ def _maybe_run_cleanup(
     retention_days: int,
     cleanup_interval: float,
     last_cleanup: list[float],
-    stale_task_timeout: timedelta | None = None,
 ) -> None:
     """Run cleanup if retention is enabled and interval has passed.
-
-    Also reaps stale RUNNING tasks if ``stale_task_timeout`` is set.
 
     Args:
         pq: PQ client instance.
         retention_days: Days to keep completed/failed tasks. 0 to disable.
         cleanup_interval: Seconds between cleanup runs.
         last_cleanup: Mutable list containing last cleanup timestamp.
-        stale_task_timeout: If set, RUNNING tasks older than this are
-            marked FAILED. Pass ``None`` to disable reaping.
     """
+    if retention_days <= 0:
+        return
+
     now = time.time()
     if now - last_cleanup[0] < cleanup_interval:
         return
 
-    if retention_days > 0:
-        cutoff = datetime.now(UTC) - timedelta(days=retention_days)
-        completed = pq.clear_completed(before=cutoff)
-        failed = pq.clear_failed(before=cutoff)
+    cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+    completed = pq.clear_completed(before=cutoff)
+    failed = pq.clear_failed(before=cutoff)
 
-        if completed or failed:
-            logger.info(
-                f"Cleanup: removed {completed} completed, {failed} failed tasks"
-            )
-
-    if stale_task_timeout is not None:
-        reaped = pq.reap_stale_tasks(stale_task_timeout)
-        if reaped:
-            logger.info(f"Cleanup: reaped {reaped} stale RUNNING task(s)")
+    if completed or failed:
+        logger.info(f"Cleanup: removed {completed} completed, {failed} failed tasks")
 
     last_cleanup[0] = now
+
+
+def _maybe_reap_stale(
+    pq: PQ,
+    stale_task_timeout: timedelta | None,
+    reaper_interval: float,
+    last_reap: list[float],
+) -> None:
+    """Reap stale RUNNING tasks if enabled and interval has passed.
+
+    Args:
+        pq: PQ client instance.
+        stale_task_timeout: RUNNING tasks older than this are marked FAILED.
+            ``None`` disables reaping.
+        reaper_interval: Seconds between reaper checks.
+        last_reap: Mutable list containing last reap timestamp.
+    """
+    if stale_task_timeout is None:
+        return
+
+    now = time.time()
+    if now - last_reap[0] < reaper_interval:
+        return
+
+    reaped = pq.reap_stale_tasks(stale_task_timeout)
+    if reaped:
+        logger.info(f"Reaped {reaped} stale RUNNING task(s)")
+
+    last_reap[0] = now
 
 
 def run_worker(
@@ -454,7 +477,8 @@ def run_worker(
         )
         return
 
-    last_cleanup: list[float] = [0.0]  # Mutable container for tracking
+    last_cleanup: list[float] = [0.0]
+    last_reap: list[float] = [0.0]
 
     try:
         while True:
@@ -465,12 +489,9 @@ def run_worker(
                 pre_execute=pre_execute,
                 post_execute=post_execute,
             ):
-                _maybe_run_cleanup(
-                    pq,
-                    retention_days,
-                    cleanup_interval,
-                    last_cleanup,
-                    stale_task_timeout=stale_task_timeout,
+                _maybe_run_cleanup(pq, retention_days, cleanup_interval, last_cleanup)
+                _maybe_reap_stale(
+                    pq, stale_task_timeout, DEFAULT_REAPER_INTERVAL, last_reap
                 )
                 time.sleep(poll_interval)
     except KeyboardInterrupt:
@@ -620,15 +641,26 @@ def _process_one_off_task(
 
     elapsed = time.perf_counter() - start
 
-    # Phase 3: Update task status
+    # Phase 3: Update task status (guarded — only if still RUNNING, so we
+    # don't overwrite a reaper's FAILED verdict for an orphaned task)
     try:
         with pq.session() as session:
-            task = session.get(Task, task_id)
-            if task:
-                task.status = status
-                task.completed_at = datetime.now(UTC)
-                if error_msg:
-                    task.error = error_msg
+            values: dict[str, object] = {
+                "status": status,
+                "completed_at": datetime.now(UTC),
+            }
+            if error_msg:
+                values["error"] = error_msg
+            result = session.execute(
+                update(Task)
+                .where(Task.id == task_id, Task.status == TaskStatus.RUNNING)
+                .values(**values)
+            )
+            if result.rowcount == 0:
+                logger.warning(
+                    f"Task '{name}' (id={task_id}) was no longer RUNNING"
+                    " when Phase 3 tried to update — likely reaped"
+                )
     except Exception as e:
         logger.error(f"Error updating task status: {e}")
 
@@ -1041,12 +1073,25 @@ def _reap_and_update(pq: PQ, slot: _ChildSlot) -> None:
 
         try:
             with pq.session() as session:
-                task = session.get(Task, slot.task_id)
-                if task:
-                    task.status = result.task_status
-                    task.completed_at = datetime.now(UTC)
-                    if error_msg:
-                        task.error = error_msg
+                values: dict[str, object] = {
+                    "status": result.task_status,
+                    "completed_at": datetime.now(UTC),
+                }
+                if error_msg:
+                    values["error"] = error_msg
+                row_result = session.execute(
+                    update(Task)
+                    .where(
+                        Task.id == slot.task_id,
+                        Task.status == TaskStatus.RUNNING,
+                    )
+                    .values(**values)
+                )
+                if row_result.rowcount == 0:
+                    logger.warning(
+                        f"Task '{slot.name}' (id={slot.task_id}) was no longer"
+                        " RUNNING when reap tried to update — likely reaped"
+                    )
         except Exception as e:
             logger.error(f"Error updating task status: {e}")
 
@@ -1091,6 +1136,7 @@ def _run_concurrent(
     children: dict[int, _ChildSlot] = {}  # pid -> slot
     fd_to_pid: dict[int, int] = {}  # read_fd -> pid
     last_cleanup: list[float] = [0.0]
+    last_reap: list[float] = [0.0]
 
     try:
         while True:
@@ -1119,13 +1165,10 @@ def _run_concurrent(
             else:
                 time.sleep(poll_interval)
 
-            # Cleanup runs on every iteration (rate-limited internally)
-            _maybe_run_cleanup(
-                pq,
-                retention_days,
-                cleanup_interval,
-                last_cleanup,
-                stale_task_timeout=stale_task_timeout,
+            # Maintenance (each rate-limited independently)
+            _maybe_run_cleanup(pq, retention_days, cleanup_interval, last_cleanup)
+            _maybe_reap_stale(
+                pq, stale_task_timeout, DEFAULT_REAPER_INTERVAL, last_reap
             )
 
     except KeyboardInterrupt:
