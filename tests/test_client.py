@@ -718,12 +718,14 @@ class TestReapStaleTasks:
 
     def test_does_not_reap_pending_or_completed_tasks(self, pq: PQ) -> None:
         """Only RUNNING tasks are reaped, not PENDING/COMPLETED/FAILED."""
-        # PENDING task
-        pq.enqueue(dummy_handler, client_id="pending-1")
-        # COMPLETED task
-        pq.enqueue(dummy_handler, client_id="completed-1")
+        # Enqueue two tasks (both start as PENDING)
+        pq.enqueue(dummy_handler, client_id="task-a")
+        pq.enqueue(dummy_handler, client_id="task-b")
+
+        # Process one — task-a becomes COMPLETED, task-b stays PENDING
         pq.run_worker_once()
 
+        # threshold=0 means "reap anything RUNNING at all" — but nothing is RUNNING
         reaped = pq.reap_stale_tasks(timedelta(seconds=0))
 
         assert reaped == 0
