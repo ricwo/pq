@@ -678,10 +678,16 @@ class PQ:
         poll_interval: float = 1.0,
         max_runtime: float = 30 * 60,
         priorities: Set[Priority] | None = None,
+        drain_timeout: float = 20.0,
     ) -> None:
         """Run the worker loop (blocking).
 
         Each task executes in a forked child process for memory isolation.
+
+        On SIGTERM or SIGINT the worker stops claiming new tasks, waits up
+        to ``drain_timeout`` seconds for in-flight tasks to finish, then
+        kills any still-running task and marks its row FAILED with an
+        explicit shutdown error. Interrupted tasks are not re-queued.
 
         Args:
             concurrency: Maximum number of tasks to process simultaneously.
@@ -690,6 +696,10 @@ class PQ:
             max_runtime: Maximum execution time per task in seconds. Default: 30 min.
             priorities: If set, only process tasks with these priority levels.
                 Use this to dedicate workers to specific priority tiers.
+            drain_timeout: Seconds to wait for in-flight tasks on
+                SIGTERM/SIGINT. Default: 20. Set below the orchestrator's
+                termination grace period. ``0`` skips the wait: in-flight
+                tasks are killed as soon as the shutdown is noticed.
         """
         from pq.worker import run_worker
 
@@ -699,6 +709,7 @@ class PQ:
             poll_interval=poll_interval,
             max_runtime=max_runtime,
             priorities=priorities,
+            drain_timeout=drain_timeout,
         )
 
     def run_worker_once(

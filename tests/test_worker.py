@@ -7,9 +7,11 @@ import asyncio
 import multiprocessing
 import multiprocessing.managers
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from datetime import UTC, datetime, timedelta
 from typing import Any
+
+import pytest
 
 from pq.client import PQ
 from pq.models import Periodic
@@ -1470,3 +1472,371 @@ class TestPerTaskMaxRuntimeEnforcement:
             f"Lock window {window_seconds:.1f}s exceeds the per-task "
             f"override + measurement slack."
         )
+
+
+def shutdown_probe_handler(duration: float, marker: str) -> None:
+    """Sleep, then append a completion marker.
+
+    Drain tests assert on the marker's presence/absence: a task that was
+    allowed to finish appends it; a task SIGKILLed by the drain never does.
+    """
+    time.sleep(duration)
+    _shared_results.append(marker)
+
+
+class TestGracefulShutdown:
+    """Tests for SIGTERM/SIGINT graceful drain (run_worker)."""
+
+    @pytest.fixture(autouse=True)
+    def _reap_leaked_workers(self) -> Generator[None, None, None]:
+        """SIGKILL and reap any forked worker a failing test left behind.
+
+        Without this, a worker orphaned by an assertion failure keeps
+        polling the shared test database and claims tasks enqueued by
+        subsequent tests, cascading the failure.
+        """
+        import os
+        import signal as sig
+
+        self._worker_pids: list[int] = []
+        yield
+        for pid in self._worker_pids:
+            try:
+                os.kill(pid, sig.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass  # already reaped by _wait_for_exit
+
+    def _fork_worker(
+        self,
+        db_url: str,
+        *,
+        concurrency: int = 1,
+        drain_timeout: float = 5.0,
+        poll_interval: float = 0.1,
+        max_runtime: float = 30,
+    ) -> int:
+        """Fork a child process running run_worker. Returns child pid.
+
+        Creates a fresh PQ instance in the child to avoid sharing the
+        parent's connection pool across fork. Caller must eventually signal
+        the child and reap it with os.waitpid; the autouse fixture cleans
+        up on test failure.
+        """
+        import os
+
+        from pq.worker import run_worker
+
+        pid = os.fork()
+        if pid == 0:
+            child_pq = PQ(db_url)
+            try:
+                run_worker(
+                    child_pq,
+                    concurrency=concurrency,
+                    poll_interval=poll_interval,
+                    max_runtime=max_runtime,
+                    drain_timeout=drain_timeout,
+                    retention_days=0,
+                    stale_task_timeout=None,
+                )
+            finally:
+                child_pq.close()
+                os._exit(0)
+        self._worker_pids.append(pid)
+        return pid
+
+    def _wait_for(
+        self,
+        predicate: Callable[[], bool],
+        *,
+        timeout: float = 5,
+        poll: float = 0.05,
+    ) -> None:
+        """Poll until predicate returns True, or raise AssertionError."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return
+            time.sleep(poll)
+        raise AssertionError(f"Condition not met within {timeout}s")
+
+    def _wait_for_exit(self, pid: int, *, timeout: float = 10) -> None:
+        """Wait for the worker process to exit, or fail (and clean up)."""
+        import os
+        import signal as sig
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+            if done == pid:
+                self._worker_pids.remove(pid)
+                return
+            time.sleep(0.05)
+        os.kill(pid, sig.SIGKILL)
+        os.waitpid(pid, 0)
+        self._worker_pids.remove(pid)
+        raise AssertionError(f"Worker did not exit within {timeout}s")
+
+    def _task_running(self, pq: PQ, task_id: int) -> bool:
+        task = pq.get_task(task_id)
+        return task is not None and task.status.value == "running"
+
+    def _assert_no_running(self, pq: PQ) -> None:
+        """No orphaned RUNNING rows after shutdown."""
+        from sqlalchemy import select as sa_select
+
+        from pq.models import Task, TaskStatus
+
+        with pq.session() as session:
+            running = (
+                session.execute(
+                    sa_select(Task).where(Task.status == TaskStatus.RUNNING)
+                )
+                .scalars()
+                .all()
+            )
+            assert running == [], f"Orphaned RUNNING rows: {running}"
+
+    def test_sigterm_idle_worker_exits_promptly(self, db_url: str) -> None:
+        """SIGTERM with an empty queue -> prompt clean exit."""
+        import os
+        import signal as sig
+
+        pid = self._fork_worker(db_url)
+        time.sleep(0.5)  # let the worker install handlers and start polling
+
+        start = time.perf_counter()
+        os.kill(pid, sig.SIGTERM)
+        self._wait_for_exit(pid, timeout=5)
+        assert time.perf_counter() - start < 2.0
+
+    def test_sigterm_fast_task_completes(
+        self, pq: PQ, db_url: str, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """In-flight task finishing within drain_timeout is written COMPLETED."""
+        import os
+        import signal as sig
+
+        results = manager.list()
+        _set_shared_results(results)
+
+        task_id = pq.enqueue(shutdown_probe_handler, duration=1.0, marker="done")
+        pid = self._fork_worker(db_url, drain_timeout=10.0)
+
+        self._wait_for(lambda: self._task_running(pq, task_id))
+        os.kill(pid, sig.SIGTERM)
+        self._wait_for_exit(pid)
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status.value == "completed"
+        assert list(results) == ["done"]
+        self._assert_no_running(pq)
+
+    def test_sigterm_slow_task_killed_and_failed(
+        self, pq: PQ, db_url: str, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Task overrunning drain_timeout is killed and marked FAILED."""
+        import os
+        import signal as sig
+
+        results = manager.list()
+        _set_shared_results(results)
+
+        task_id = pq.enqueue(shutdown_probe_handler, duration=30.0, marker="done")
+        pid = self._fork_worker(db_url, drain_timeout=1.0)
+
+        self._wait_for(lambda: self._task_running(pq, task_id))
+        start = time.perf_counter()
+        os.kill(pid, sig.SIGTERM)
+        self._wait_for_exit(pid, timeout=8)
+        assert time.perf_counter() - start < 5.0  # ~1s drain + writes
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status.value == "failed"
+        assert "shutdown" in (task.error or "")
+        assert task.completed_at is not None
+        assert task.attempts == 1
+        assert list(results) == []  # handler never finished
+        self._assert_no_running(pq)
+
+    def test_drain_timeout_zero_kills_immediately(
+        self, pq: PQ, db_url: str, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """drain_timeout=0 -> in-flight task killed at once, prompt exit."""
+        import os
+        import signal as sig
+
+        results = manager.list()
+        _set_shared_results(results)
+
+        task_id = pq.enqueue(shutdown_probe_handler, duration=30.0, marker="done")
+        pid = self._fork_worker(db_url, drain_timeout=0.0)
+
+        self._wait_for(lambda: self._task_running(pq, task_id))
+        start = time.perf_counter()
+        os.kill(pid, sig.SIGTERM)
+        self._wait_for_exit(pid, timeout=5)
+        assert time.perf_counter() - start < 3.0
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status.value == "failed"
+        assert "shutdown" in (task.error or "")
+        self._assert_no_running(pq)
+
+    def test_second_sigterm_during_drain_is_ignored(
+        self, pq: PQ, db_url: str, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """A repeat SIGTERM must not abandon the drain: the in-flight task
+        still gets to finish and its status is written."""
+        import os
+        import signal as sig
+
+        results = manager.list()
+        _set_shared_results(results)
+
+        task_id = pq.enqueue(shutdown_probe_handler, duration=1.5, marker="done")
+        pid = self._fork_worker(db_url, drain_timeout=10.0)
+
+        self._wait_for(lambda: self._task_running(pq, task_id))
+        os.kill(pid, sig.SIGTERM)
+        time.sleep(0.3)  # inside the drain window
+        os.kill(pid, sig.SIGTERM)
+        self._wait_for_exit(pid)
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status.value == "completed"
+        assert list(results) == ["done"]
+        self._assert_no_running(pq)
+
+    def test_sigint_drains_like_sigterm(
+        self, pq: PQ, db_url: str, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """SIGINT (Ctrl-C) goes through the same drain path — including the
+        sequential worker, which previously abandoned its child."""
+        import os
+        import signal as sig
+
+        results = manager.list()
+        _set_shared_results(results)
+
+        task_id = pq.enqueue(shutdown_probe_handler, duration=1.0, marker="done")
+        pid = self._fork_worker(db_url, concurrency=1, drain_timeout=10.0)
+
+        self._wait_for(lambda: self._task_running(pq, task_id))
+        os.kill(pid, sig.SIGINT)
+        self._wait_for_exit(pid)
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status.value == "completed"
+        assert list(results) == ["done"]
+        self._assert_no_running(pq)
+
+    def test_concurrent_mixed_fast_and_slow(
+        self, pq: PQ, db_url: str, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Concurrent drain: fast child completes, slow child killed+FAILED."""
+        import os
+        import signal as sig
+
+        results = manager.list()
+        _set_shared_results(results)
+
+        fast_id = pq.enqueue(shutdown_probe_handler, duration=1.5, marker="fast")
+        slow_id = pq.enqueue(shutdown_probe_handler, duration=30.0, marker="slow")
+        pid = self._fork_worker(db_url, concurrency=3, drain_timeout=4.0)
+
+        self._wait_for(
+            lambda: self._task_running(pq, fast_id) and self._task_running(pq, slow_id)
+        )
+        os.kill(pid, sig.SIGTERM)
+        self._wait_for_exit(pid, timeout=8)
+
+        fast = pq.get_task(fast_id)
+        slow = pq.get_task(slow_id)
+        assert fast is not None and fast.status.value == "completed"
+        assert slow is not None and slow.status.value == "failed"
+        assert "shutdown" in (slow.error or "")
+        assert list(results) == ["fast"]
+        self._assert_no_running(pq)
+
+    def test_sequential_slow_task_killed(
+        self, pq: PQ, db_url: str, manager: multiprocessing.managers.SyncManager
+    ) -> None:
+        """Sequential worker blocked on a running task honours the deadline
+        (previously it would sit in os.wait4 until the task finished)."""
+        import os
+        import signal as sig
+
+        results = manager.list()
+        _set_shared_results(results)
+
+        task_id = pq.enqueue(shutdown_probe_handler, duration=30.0, marker="done")
+        pid = self._fork_worker(db_url, concurrency=1, drain_timeout=1.0)
+
+        self._wait_for(lambda: self._task_running(pq, task_id))
+        start = time.perf_counter()
+        os.kill(pid, sig.SIGTERM)
+        self._wait_for_exit(pid, timeout=8)
+        assert time.perf_counter() - start < 5.0
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status.value == "failed"
+        assert "shutdown" in (task.error or "")
+        self._assert_no_running(pq)
+
+    def test_periodic_in_flight_lock_cleared(self, pq: PQ, db_url: str) -> None:
+        """Periodic task killed by the drain: locked_until cleared, schedule
+        intact, no one-off rows involved."""
+        import os
+        import signal as sig
+
+        from sqlalchemy import select as sa_select
+
+        pq.schedule(
+            periodic_sleep_handler,
+            run_every=timedelta(seconds=60),
+            max_concurrent=1,
+        )
+        pid = self._fork_worker(db_url, concurrency=2, drain_timeout=1.0)
+
+        def _locked() -> bool:
+            with pq.session() as session:
+                periodic = session.execute(sa_select(Periodic)).scalar_one()
+                return periodic.locked_until is not None
+
+        self._wait_for(_locked)
+        os.kill(pid, sig.SIGTERM)
+        self._wait_for_exit(pid, timeout=8)
+
+        with pq.session() as session:
+            periodic = session.execute(sa_select(Periodic)).scalar_one()
+            assert periodic.locked_until is None
+            assert periodic.last_run is not None
+            assert periodic.active is True
+        self._assert_no_running(pq)
+
+    def test_drain_timeout_validation(self, pq: PQ) -> None:
+        """Negative / non-finite drain_timeout is rejected."""
+        import pytest
+
+        from pq.worker import run_worker
+
+        with pytest.raises(ValueError):
+            run_worker(pq, drain_timeout=-1.0)
+        with pytest.raises(ValueError):
+            run_worker(pq, drain_timeout=float("inf"))
+
+
+def periodic_sleep_handler() -> None:
+    """Periodic handler that sleeps long enough to straddle the drain."""
+    time.sleep(30)

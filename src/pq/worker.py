@@ -8,14 +8,18 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import os
 import select as select_module
 import signal
 import sys
+import threading
 import time
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import FrameType
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 from croniter import croniter
@@ -27,10 +31,15 @@ from pq.registry import resolve_function_path
 from pq.serialization import deserialize
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Set
+    from collections.abc import Set
 
     from pq.client import PQ
     from pq.priority import Priority
+
+# What ``signal.getsignal`` returns / ``signal.signal`` accepts.
+_SignalHandler = (
+    Callable[[int, FrameType | None], object] | int | signal.Handlers | None
+)
 
 
 class PreExecuteHook(Protocol):
@@ -83,6 +92,13 @@ DEFAULT_STALE_TASK_TIMEOUT: timedelta = timedelta(hours=1)
 # How often the worker checks for stale RUNNING tasks.
 DEFAULT_REAPER_INTERVAL: float = 300
 
+# Default drain timeout: 20 seconds
+# On SIGTERM/SIGINT the worker stops claiming and waits up to this long for
+# in-flight tasks to finish before SIGKILLing them and marking them FAILED.
+# Sits under the common 30 s orchestrator termination grace period, leaving
+# headroom for the final status writes.
+DEFAULT_DRAIN_TIMEOUT: float = 20.0
+
 # Exit codes for child process
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
@@ -134,6 +150,103 @@ class TaskKilledError(WorkerError):
     pass
 
 
+class TaskInterruptedError(WorkerError):
+    """Raised when a task is killed because the worker is shutting down."""
+
+    pass
+
+
+@dataclass
+class _ShutdownState:
+    """Graceful-shutdown coordination for the worker loops.
+
+    Written by the signal handler (which runs in the main thread between
+    bytecodes, so no locking is needed) and read by the worker loops and
+    ``_wait_for_child``. Module-level because a worker owns its process;
+    ``run_worker`` resets it on entry.
+    """
+
+    requested: bool = False
+    deadline: float | None = None  # time.monotonic() deadline, set on signal
+    drain_timeout: float = DEFAULT_DRAIN_TIMEOUT
+
+    def reset(self, drain_timeout: float) -> None:
+        self.requested = False
+        self.deadline = None
+        self.drain_timeout = drain_timeout
+
+    def deadline_passed(self) -> bool:
+        """True once shutdown was requested and the drain budget is spent."""
+        if not self.requested:
+            return False
+        return self.deadline is None or time.monotonic() >= self.deadline
+
+
+_shutdown = _ShutdownState()
+
+
+def _handle_shutdown_signal(signum: int, frame: FrameType | None) -> None:
+    """SIGTERM/SIGINT handler: request a drain, never raise.
+
+    Raising from here would land at arbitrary bytecode and could orphan a
+    task (e.g. between claim-commit and child registration). Repeat signals
+    during the drain are ignored so they can't abandon remaining children.
+    """
+    if _shutdown.requested:
+        return
+    _shutdown.deadline = time.monotonic() + _shutdown.drain_timeout
+    _shutdown.requested = True
+    logger.info(
+        f"Received signal {signum}, draining"
+        f" (drain_timeout={_shutdown.drain_timeout}s)..."
+    )
+
+
+def _install_shutdown_handlers() -> dict[int, _SignalHandler] | None:
+    """Register the drain handler for SIGTERM/SIGINT.
+
+    Returns the previous handlers (for restoration), or ``None`` when not
+    running in the main thread — ``signal.signal`` is only allowed there, so
+    in that case the worker keeps the legacy KeyboardInterrupt-only behavior.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        logger.warning(
+            "Worker is not running in the main thread; SIGTERM graceful"
+            " shutdown is disabled (only KeyboardInterrupt is handled)."
+        )
+        return None
+    previous: dict[int, _SignalHandler] = {}
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, _handle_shutdown_signal)
+    return previous
+
+
+def _restore_shutdown_handlers(previous: dict[int, _SignalHandler] | None) -> None:
+    """Restore the signal handlers saved by ``_install_shutdown_handlers``."""
+    if previous is None:
+        return
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
+
+
+def _kill_child_group(child_pid: int) -> None:
+    """SIGKILL a task child's process group (best effort).
+
+    The child calls ``os.setpgrp()`` first thing, so its pgid equals its
+    pid. If the signal lands before ``setpgrp()`` the process group doesn't
+    exist yet — fall back to killing the pid directly. ESRCH everywhere
+    means the child already exited; the caller reaps it normally.
+    """
+    try:
+        os.killpg(child_pid, signal.SIGKILL)
+    except ProcessLookupError:
+        try:
+            os.kill(child_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 def _child_timeout_handler(signum: int, frame: Any) -> None:
     """Signal handler for timeout in child process."""
     os._exit(EXIT_TIMEOUT)
@@ -155,6 +268,12 @@ def _run_in_child(
     """
     # Create new process group so we don't get parent's signals
     os.setpgrp()
+
+    # Restore default signal disposition: the fork inherits the parent's
+    # drain handler, which in the child would silently swallow a direct
+    # SIGTERM/SIGINT (e.g. from systemd's cgroup-wide kill).
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
 
     # Set up timeout
     signal.signal(signal.SIGALRM, _child_timeout_handler)
@@ -241,6 +360,15 @@ def _fork_child(
 def _wait_for_child(child_pid: int, read_fd: int) -> _ChildResult:
     """Wait for a forked child process and return the result.
 
+    The wait is drain-aware: once shutdown has been requested and the drain
+    deadline has passed, the child's process group is SIGKILLed and the
+    result reports the ``"shutdown"`` exit kind. A blocking ``os.wait4``
+    would never notice the shutdown flag (PEP 475 retries the syscall after
+    the non-raising signal handler), so this polls with ``WNOHANG`` and
+    sleeps in ``select`` on the child's error pipe — the pipe closes when
+    the child exits, so child completion wakes the wait immediately, while
+    the bounded timeout keeps flag/deadline checks prompt.
+
     Args:
         child_pid: PID of the child process.
         read_fd: Read end of the error pipe.
@@ -248,10 +376,30 @@ def _wait_for_child(child_pid: int, read_fd: int) -> _ChildResult:
     Returns:
         _ChildResult with task status, error message, and exit kind.
     """
-    _, raw_status, rusage = os.wait4(child_pid, 0)
-
-    # Read error message from pipe
+    killed_by_drain = False
     error_bytes = b""
+    while True:
+        pid, raw_status, rusage = os.wait4(child_pid, os.WNOHANG)
+        if pid != 0:
+            break
+        if not killed_by_drain and _shutdown.deadline_passed():
+            _kill_child_group(child_pid)
+            killed_by_drain = True
+        timeout = 1.0
+        if _shutdown.requested and _shutdown.deadline is not None:
+            timeout = min(timeout, max(0.0, _shutdown.deadline - time.monotonic()))
+            timeout = max(timeout, 0.01)  # killed child needs a moment to exit
+        ready, _, _ = select_module.select([read_fd], [], [], timeout)
+        if ready:
+            # Drain incrementally: an error message larger than the pipe
+            # buffer would otherwise block the child in write() while we
+            # spin on an always-readable fd.
+            try:
+                error_bytes += os.read(read_fd, 65536)
+            except OSError:
+                pass
+
+    # Read any remaining error output from the pipe
     try:
         while True:
             chunk = os.read(read_fd, 4096)
@@ -267,6 +415,13 @@ def _wait_for_child(child_pid: int, read_fd: int) -> _ChildResult:
 
     if os.WIFSIGNALED(raw_status):
         signal_num = os.WTERMSIG(raw_status)
+        if killed_by_drain and signal_num == signal.SIGKILL:
+            return _ChildResult(
+                TaskStatus.FAILED,
+                "Task interrupted by worker shutdown"
+                f" (exceeded drain_timeout={_shutdown.drain_timeout}s)",
+                "shutdown",
+            )
         if signal_num == signal.SIGKILL:
             max_rss_kb = rusage.ru_maxrss
             if sys.platform == "darwin":
@@ -351,7 +506,26 @@ def _execute_in_fork(
         raise TaskOOMError(result.error_msg or "Task killed (likely OOM)")
     if result.exit_kind == "killed":
         raise TaskKilledError(result.error_msg or "Task killed by signal")
+    if result.exit_kind == "shutdown":
+        raise TaskInterruptedError(
+            result.error_msg or "Task interrupted by worker shutdown"
+        )
     raise Exception(result.error_msg or "Task failed")
+
+
+def _interruptible_sleep(seconds: float) -> None:
+    """Sleep up to ``seconds``, returning early once shutdown is requested.
+
+    A plain ``time.sleep`` would run to completion despite SIGTERM (PEP 475
+    retries it after the non-raising handler), delaying an idle worker's
+    shutdown by up to ``poll_interval``.
+    """
+    deadline = time.monotonic() + seconds
+    while not _shutdown.requested:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.1, remaining))
 
 
 def _maybe_run_cleanup(
@@ -424,12 +598,21 @@ def run_worker(
     retention_days: int = DEFAULT_RETENTION_DAYS,
     cleanup_interval: float = DEFAULT_CLEANUP_INTERVAL,
     stale_task_timeout: timedelta | None = DEFAULT_STALE_TASK_TIMEOUT,
+    drain_timeout: float = DEFAULT_DRAIN_TIMEOUT,
     pre_execute: PreExecuteHook | None = None,
     post_execute: PostExecuteHook | None = None,
 ) -> None:
     """Run the worker loop indefinitely.
 
     Each task executes in a forked child process for memory isolation.
+
+    On SIGTERM or SIGINT the worker shuts down gracefully: it stops
+    claiming new tasks, waits up to ``drain_timeout`` seconds for in-flight
+    tasks to finish (writing their statuses as usual), then SIGKILLs any
+    still-running task children and marks their rows FAILED with an explicit
+    shutdown error. Interrupted tasks are NOT re-queued — pq's at-most-once
+    semantics are preserved; applications that need redelivery must
+    re-enqueue such tasks themselves.
 
     Args:
         pq: PQ client instance.
@@ -445,11 +628,24 @@ def run_worker(
         stale_task_timeout: Mark RUNNING tasks older than this as FAILED.
             Catches orphaned tasks whose worker died mid-execution.
             Default: 1 hour. Set to ``None`` to disable.
+        drain_timeout: Seconds to wait for in-flight tasks when shutting
+            down on SIGTERM/SIGINT. Default: 20. Must be set below the
+            orchestrator's termination grace period, with headroom for the
+            final status writes. ``0`` skips the wait entirely: in-flight
+            tasks are killed as soon as the shutdown is noticed (within
+            about a second).
         pre_execute: Called in forked child BEFORE task execution.
             Use for initializing fork-unsafe resources (OTel, DB connections).
         post_execute: Called in forked child AFTER task execution (success or failure).
             Use for cleanup/flushing (OTel traces, etc.).
+
+    Raises:
+        ValueError: If ``drain_timeout`` is negative or not finite.
     """
+    if math.isnan(drain_timeout) or math.isinf(drain_timeout) or drain_timeout < 0:
+        raise ValueError(
+            f"drain_timeout must be a finite number >= 0 (got {drain_timeout!r})"
+        )
     if priorities:
         priority_names = ", ".join(p.name for p in sorted(priorities, reverse=True))
         logger.info(
@@ -462,40 +658,55 @@ def run_worker(
             " fork isolation enabled)..."
         )
 
-    if concurrency > 1:
-        _run_concurrent(
-            pq,
-            concurrency=concurrency,
-            poll_interval=poll_interval,
-            max_runtime=max_runtime,
-            priorities=priorities,
-            pre_execute=pre_execute,
-            post_execute=post_execute,
-            retention_days=retention_days,
-            cleanup_interval=cleanup_interval,
-            stale_task_timeout=stale_task_timeout,
-        )
-        return
-
-    last_cleanup: list[float] = [0.0]
-    last_reap: list[float] = [0.0]
-
+    _shutdown.reset(drain_timeout)
+    previous_handlers = _install_shutdown_handlers()
     try:
-        while True:
-            if not run_worker_once(
+        if concurrency > 1:
+            _run_concurrent(
                 pq,
+                concurrency=concurrency,
+                poll_interval=poll_interval,
                 max_runtime=max_runtime,
                 priorities=priorities,
                 pre_execute=pre_execute,
                 post_execute=post_execute,
-            ):
-                _maybe_run_cleanup(pq, retention_days, cleanup_interval, last_cleanup)
-                _maybe_reap_stale(
-                    pq, stale_task_timeout, DEFAULT_REAPER_INTERVAL, last_reap
-                )
-                time.sleep(poll_interval)
-    except KeyboardInterrupt:
+                retention_days=retention_days,
+                cleanup_interval=cleanup_interval,
+                stale_task_timeout=stale_task_timeout,
+            )
+            return
+
+        last_cleanup: list[float] = [0.0]
+        last_reap: list[float] = [0.0]
+
+        try:
+            while not _shutdown.requested:
+                if not run_worker_once(
+                    pq,
+                    max_runtime=max_runtime,
+                    priorities=priorities,
+                    pre_execute=pre_execute,
+                    post_execute=post_execute,
+                ):
+                    if _shutdown.requested:
+                        break
+                    _maybe_run_cleanup(
+                        pq, retention_days, cleanup_interval, last_cleanup
+                    )
+                    _maybe_reap_stale(
+                        pq, stale_task_timeout, DEFAULT_REAPER_INTERVAL, last_reap
+                    )
+                    _interruptible_sleep(poll_interval)
+        except KeyboardInterrupt:
+            # Fallback for non-main-thread workers (no handlers installed).
+            pass
         logger.info("Worker stopped.")
+    finally:
+        _restore_shutdown_handlers(previous_handlers)
+        # Clear the drain state: a lingering past-deadline flag would make
+        # later run_worker_once calls in this process kill their children
+        # on the first _wait_for_child iteration.
+        _shutdown.reset(drain_timeout)
 
 
 def run_worker_once(
@@ -644,6 +855,10 @@ def _process_one_off_task(
         error_msg = str(e)
 
     except TaskKilledError as e:
+        status = TaskStatus.FAILED
+        error_msg = str(e)
+
+    except TaskInterruptedError as e:
         status = TaskStatus.FAILED
         error_msg = str(e)
 
@@ -817,6 +1032,10 @@ def _process_periodic_task(
     except TaskKilledError as e:
         elapsed = time.perf_counter() - start
         logger.error(f"Periodic task '{name}' killed after {elapsed:.3f} s: {e}")
+
+    except TaskInterruptedError as e:
+        elapsed = time.perf_counter() - start
+        logger.warning(f"Periodic task '{name}' interrupted after {elapsed:.3f} s: {e}")
 
     except Exception as e:
         elapsed = time.perf_counter() - start
@@ -1095,6 +1314,11 @@ def _reap_and_update(pq: PQ, slot: _ChildSlot) -> None:
                 f"Periodic task '{slot.name}' killed after {elapsed:.3f} s:"
                 f" {result.error_msg}"
             )
+        elif result.exit_kind == "shutdown":
+            logger.warning(
+                f"Periodic task '{slot.name}' interrupted after {elapsed:.3f} s:"
+                f" {result.error_msg}"
+            )
         else:
             logger.error(
                 f"Periodic task '{slot.name}' failed after {elapsed:.3f} s:"
@@ -1186,9 +1410,9 @@ def _run_concurrent(
     last_reap: list[float] = [0.0]
 
     try:
-        while True:
+        while not _shutdown.requested:
             # Step 1: Fill empty slots with new tasks
-            while len(children) < concurrency:
+            while len(children) < concurrency and not _shutdown.requested:
                 slot = _try_claim_and_fork(
                     pq,
                     max_runtime=max_runtime,
@@ -1210,7 +1434,10 @@ def _run_concurrent(
                     slot = children.pop(pid)
                     _reap_and_update(pq, slot)
             else:
-                time.sleep(poll_interval)
+                _interruptible_sleep(poll_interval)
+
+            if _shutdown.requested:
+                break
 
             # Maintenance (each rate-limited independently)
             _maybe_run_cleanup(pq, retention_days, cleanup_interval, last_cleanup)
@@ -1219,10 +1446,16 @@ def _run_concurrent(
             )
 
     except KeyboardInterrupt:
-        if children:
-            logger.info(
-                f"Shutting down, waiting for {len(children)} task(s) to finish..."
-            )
-            for slot in list(children.values()):
-                _reap_and_update(pq, slot)
-        logger.info("Worker stopped.")
+        # Fallback for non-main-thread workers (no handlers installed); the
+        # drain below still runs, just without a deadline.
+        pass
+
+    if children:
+        logger.info(f"Shutting down, draining {len(children)} in-flight task(s)...")
+        # _wait_for_child inside _reap_and_update enforces the drain
+        # deadline (absolute, shared by all children): each child either
+        # finishes in time and gets its real status, or is SIGKILLed and
+        # marked FAILED with the shutdown error.
+        for slot in list(children.values()):
+            _reap_and_update(pq, slot)
+    logger.info("Worker stopped.")
