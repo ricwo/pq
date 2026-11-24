@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    ColumnElement,
     DateTime,
     Enum,
     Float,
@@ -18,7 +19,11 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    cast,
     func,
+    literal_column,
+    null,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -44,7 +49,23 @@ class Task(Base):
 
     __tablename__ = "pq_tasks"
     __table_args__ = (
-        Index("ix_pq_tasks_status_priority_run_at", "status", "priority", "run_at"),
+        # The claim: the first entry is the pending task to run next, so a
+        # claim reads one entry however long the backlog is.
+        Index(
+            "ix_pq_tasks_pending",
+            text("priority DESC"),
+            "run_at",
+            postgresql_where=text("status = 'PENDING'"),
+        ),
+        # Everything else that looks rows up by status: the stale reaper
+        # (RUNNING), and cleanup and listings (COMPLETED or FAILED, by
+        # ``completed_at``).
+        Index(
+            "ix_pq_tasks_status_completed_at",
+            "status",
+            "completed_at",
+            postgresql_where=text("status <> 'PENDING'"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
@@ -90,26 +111,32 @@ class Task(Base):
         JSONB(none_as_null=True), nullable=True
     )
 
-    def apply_requeue(self) -> None:
-        """Turn this RUNNING row into a fresh PENDING task from ``requeue``.
 
-        The caller must hold a row lock (``FOR UPDATE``) and guarantee
-        that ``requeue`` is not None.
-        """
-        spec = self.requeue
-        if spec is None:
-            raise ValueError(f"Task id={self.id} has no parked requeue version")
-        self.name = spec["name"]
-        self.payload = spec["payload"]
-        self.priority = spec["priority"]
-        self.run_at = datetime.fromisoformat(spec["run_at"])
-        self.max_runtime_seconds = spec["max_runtime_seconds"]
-        self.status = TaskStatus.PENDING
-        self.attempts = 0
-        self.started_at = None
-        self.completed_at = None
-        self.error = None
-        self.requeue = None
+def requeue_values() -> dict[str, ColumnElement[Any]]:
+    """``UPDATE`` values that turn a RUNNING row into a fresh PENDING task
+    from the version parked in ``Task.requeue``.
+
+    For a statement whose ``WHERE`` keeps rows with ``requeue IS NOT NULL``,
+    or that picks these values per row with ``CASE``. Applied in SQL so that
+    ending a run is one statement: the row lock it takes serializes it with a
+    concurrent ``upsert()``.
+    """
+    spec = Task.requeue
+    return {
+        "name": spec["name"].astext,
+        "payload": spec["payload"],
+        "priority": spec["priority"].astext.cast(SmallInteger),
+        "run_at": spec["run_at"].astext.cast(DateTime(timezone=True)),
+        "max_runtime_seconds": spec["max_runtime_seconds"].astext.cast(Float),
+        # Cast: in a ``CASE`` next to another literal, Postgres would type a
+        # bare ``'PENDING'`` as text, which the enum column does not accept.
+        "status": cast(literal_column("'PENDING'"), Task.status.type),
+        "attempts": literal_column("0"),
+        "started_at": null(),
+        "completed_at": null(),
+        "error": null(),
+        "requeue": null(),
+    }
 
 
 class Periodic(Base):

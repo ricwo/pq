@@ -143,6 +143,8 @@ def heartbeat() -> None:
 pq.schedule(heartbeat, run_every=timedelta(minutes=5))
 ```
 
+Call `schedule()` on every application start: it creates the schedule or updates it. A schedule whose `run_every` or `cron` did not change keeps its next run time, so a restart does not run the task again, and a cron time that came due during the restart still runs. A new schedule, one whose timing changed, and one that was inactive first run right away (`run_every`) or at the next cron time.
+
 ### Cron expressions
 
 ```python
@@ -205,6 +207,8 @@ Kill tasks that run too long:
 pq.run_worker(max_runtime=300)  # 5 minute timeout per task
 ```
 
+The task's process stops itself at `max_runtime`. If it cannot (it is blocked in native code, or the task changed its own `SIGALRM` handling), the worker kills it 10 seconds later, with anything it started. A `TimeoutError` raised by the task itself is an ordinary failure, with its traceback.
+
 ### Priority-dedicated workers
 
 Reserve workers for high-priority tasks:
@@ -260,8 +264,8 @@ Arguments are serialized automatically:
 | Type | Method |
 |------|--------|
 | JSON-serializable (str, int, list, dict) | JSON |
-| Pydantic models | `model_dump()` → JSON |
-| Custom objects, lambdas | dill (pickle) |
+| Pydantic models | `model_dump(mode="json")` → JSON (the task receives a dict) |
+| Custom objects, lambdas, `NaN`, strings with a NUL character | dill (pickle) |
 
 ## Async tasks
 
@@ -304,6 +308,10 @@ Worker (parent)
 ```
 
 The parent monitors via `os.wait4()` and detects timeout, OOM (SIGKILL), and signal-based crashes. The child process exits after every task, giving you true memory isolation.
+
+A child shares the worker's memory until it writes to it. The child freezes what it inherited for the garbage collector (`gc.freeze()`), so a collection in the child does not copy those pages: in a measurement with a 730 MB worker, one collection copied 390 MB without the freeze and 24 MB with it.
+
+One-off tasks and periodic schedules form one queue: the highest priority runs first, and within a priority whichever came due first. A backlog of one-off tasks delays a schedule of the same priority no more than it delays a task that came due at the same time. Give a schedule a higher priority to keep it on time under load.
 
 Multiple workers can run in parallel. Tasks are claimed atomically with PostgreSQL's `FOR UPDATE SKIP LOCKED`, so each task runs exactly once.
 

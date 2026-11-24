@@ -14,13 +14,18 @@ import dill
 from pydantic import BaseModel
 
 
-def _is_json_serializable(value: Any) -> bool:
-    """Check if a value can be JSON-serialized."""
+def _is_json_storable(value: Any) -> bool:
+    """Check if a value can be stored in a JSONB column as it is.
+
+    Stricter than "``json.dumps`` accepts it": Postgres rejects ``NaN`` and
+    ``Infinity`` (which ``json.dumps`` writes by default) and the NUL
+    character in a string.
+    """
     try:
-        json.dumps(value)
-        return True
+        encoded = json.dumps(value, allow_nan=False)
     except (TypeError, ValueError):
         return False
+    return "\\u0000" not in encoded
 
 
 def _prepare_value(value: Any) -> tuple[Any, bool]:
@@ -29,12 +34,12 @@ def _prepare_value(value: Any) -> tuple[Any, bool]:
     Returns:
         Tuple of (prepared_value, is_pickled).
     """
-    # Handle Pydantic models
+    # Pydantic models are stored as their JSON form: ``mode="json"`` turns
+    # datetimes, UUIDs, Decimals and enums into JSON types.
     if isinstance(value, BaseModel):
-        return value.model_dump(), False
+        value = value.model_dump(mode="json")
 
-    # Try JSON serialization
-    if _is_json_serializable(value):
+    if _is_json_storable(value):
         return value, False
 
     # Fall back to dill (handles local objects, lambdas, etc.)
@@ -56,8 +61,8 @@ def serialize(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
     """Serialize args and kwargs for database storage.
 
     For each value:
-    1. If Pydantic BaseModel, use model_dump()
-    2. If JSON-serializable, store directly
+    1. If Pydantic BaseModel, use model_dump(mode="json")
+    2. If JSONB can hold it, store directly
     3. Otherwise, pickle and base64-encode
 
     Args:

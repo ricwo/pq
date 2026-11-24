@@ -4,7 +4,8 @@ import importlib.resources
 import math
 import os
 import weakref
-from collections.abc import Callable, Sequence, Set
+from functools import lru_cache
+from collections.abc import Callable, Iterator, Sequence, Set
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -16,11 +17,11 @@ from croniter.croniter import CroniterBadCronError
 from loguru import logger
 import sqlalchemy as sa
 from sqlalchemy import create_engine, delete, func, select, update
-from sqlalchemy.dialects.postgresql import JSONB, insert
+from sqlalchemy.dialects.postgresql import Insert, insert
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import InstrumentedAttribute, sessionmaker
+from sqlalchemy.orm import InstrumentedAttribute, Session, sessionmaker
 
-from pq.models import Base, Periodic, Task, TaskStatus
+from pq.models import Base, Periodic, Task, TaskStatus, requeue_values
 from pq.priority import Priority
 from pq.registry import get_function_path
 from pq.serialization import serialize
@@ -63,6 +64,18 @@ def _validate_max_runtime(max_runtime_seconds: float | None) -> None:
             f"max_runtime_seconds must be > 0 (got {max_runtime_seconds!r}); pass None to "
             f"use the worker's configured default."
         )
+    if max_runtime_seconds > _MAX_SECONDS:
+        raise ValueError(
+            f"max_runtime_seconds must be at most {_MAX_SECONDS} (got"
+            f" {max_runtime_seconds!r}); pass None to use the worker's"
+            f" configured default."
+        )
+
+
+# Upper bound for ``max_runtime_seconds`` and ``run_every``: about 30 years.
+# A time that far ahead still fits a timestamp; much larger values overflow
+# when a schedule is claimed, which would fail on every poll.
+_MAX_SECONDS: int = 10**9
 
 
 _live_instances: "weakref.WeakSet[PQ]" = weakref.WeakSet()
@@ -139,81 +152,75 @@ class Upsert:
     max_runtime_seconds: float | None = None
 
 
-def _upsert_statement(u: Upsert) -> sa.Insert:
-    """The ``INSERT ... ON CONFLICT DO UPDATE`` behind ``PQ.upsert``."""
+def _upsert_row(u: Upsert) -> dict[str, object]:
+    """Check one item and turn it into the row ``_upsert_statement`` inserts."""
     _validate_max_runtime(u.max_runtime_seconds)
-    name = get_function_path(u.task)
-    payload = serialize(u.args, u.kwargs)
-    priority = u.priority
-    client_id = u.client_id
-    max_runtime_seconds = u.max_runtime_seconds
-    run_at = datetime.now(UTC) if u.run_at is None else u.run_at
+    return {
+        "client_id": u.client_id,
+        "name": get_function_path(u.task),
+        "payload": serialize(u.args, u.kwargs),
+        "priority": int(u.priority),
+        "status": TaskStatus.PENDING,
+        "run_at": datetime.now(UTC) if u.run_at is None else u.run_at,
+        "max_runtime_seconds": u.max_runtime_seconds,
+    }
 
-    # In ``ON CONFLICT DO UPDATE``, ``Task.<column>`` refers to the
-    # existing row. A RUNNING row keeps every column as it is (the run
-    # in progress keeps its payload, ``started_at``, ``attempts`` and
-    # ``max_runtime_seconds``); the new version is parked in
-    # ``requeue`` and applied when the run ends. Any other status gets
-    # the plain overwrite. All in one statement, so the decision is
-    # made under the row lock that ``ON CONFLICT`` takes.
+
+@lru_cache(maxsize=1)
+def _upsert_statement() -> Insert:
+    """The ``INSERT ... ON CONFLICT DO UPDATE`` behind ``PQ.upsert``, for
+    rows made by ``_upsert_row``.
+
+    In ``ON CONFLICT DO UPDATE``, ``Task.<column>`` is the existing row and
+    ``excluded.<column>`` the row that was to be inserted. A RUNNING row
+    keeps every column as it is (the run in progress keeps its payload,
+    ``started_at``, ``attempts`` and ``max_runtime_seconds``); the new
+    version is parked in ``requeue`` and applied when the run ends. Any other
+    status gets the plain overwrite. All in one statement, so the decision is
+    made under the row lock that ``ON CONFLICT`` takes.
+    """
+    stmt = insert(Task)
+    new = stmt.excluded
     running = Task.status == TaskStatus.RUNNING
-    # ``run_at`` is added in SQL as ``timestamptz``, so Postgres
-    # serializes it as ISO 8601 with an offset. A naive ``run_at`` is
-    # then read in this session's time zone, the same as on the direct
-    # path, and not later in the session of whoever applies the version.
-    requeue = sa.literal(
-        {
-            "name": name,
-            "payload": payload,
-            "priority": int(priority),
-            "max_runtime_seconds": max_runtime_seconds,
-        },
-        JSONB,
-    ).op("||", return_type=JSONB)(
-        sa.func.jsonb_build_object(
-            "run_at", sa.cast(sa.literal(run_at), sa.DateTime(timezone=True))
-        )
-    )
 
-    def unless_running[T](
-        value: T, column: InstrumentedAttribute[T]
+    def unless_running[T](column: InstrumentedAttribute[T]) -> sa.ColumnElement[T]:
+        return sa.case((running, column), else_=new[column.key])
+
+    def reset_unless_running[T](
+        column: InstrumentedAttribute[T], value: T
     ) -> sa.ColumnElement[T]:
-        # ``sa.literal(..., column.type)`` binds the value through the
-        # column's type. Required for the ``task_status`` enum, which
-        # stores member names (``'PENDING'``): a bare enum member in a
-        # ``CASE`` would bind ``'pending'`` and fail.
-        return sa.case((running, column), else_=sa.literal(value, column.type))
+        return sa.case((running, column), else_=value)
 
-    return (
-        insert(Task)
-        .values(
-            client_id=client_id,
-            name=name,
-            payload=payload,
-            priority=priority,
-            status=TaskStatus.PENDING,
-            run_at=run_at,
-            max_runtime_seconds=max_runtime_seconds,
-        )
-        .on_conflict_do_update(
-            index_elements=["client_id"],
-            set_={
-                "name": unless_running(name, Task.name),
-                "payload": unless_running(payload, Task.payload),
-                "priority": unless_running(int(priority), Task.priority),
-                "status": unless_running(TaskStatus.PENDING, Task.status),
-                "run_at": unless_running(run_at, Task.run_at),
-                "max_runtime_seconds": unless_running(
-                    max_runtime_seconds, Task.max_runtime_seconds
-                ),
-                "attempts": unless_running(0, Task.attempts),
-                "started_at": unless_running(None, Task.started_at),
-                "completed_at": unless_running(None, Task.completed_at),
-                "error": unless_running(None, Task.error),
-                "requeue": sa.case((running, requeue), else_=sa.null()),
-            },
-        )
-        .returning(Task.id)
+    # ``run_at`` goes into the JSON as ``timestamptz``, so Postgres writes it
+    # as ISO 8601 with an offset: the instant the direct path stores, whatever
+    # the time zone of the session that applies the version later.
+    requeue = sa.func.jsonb_build_object(
+        "name",
+        new.name,
+        "payload",
+        new.payload,
+        "priority",
+        new.priority,
+        "run_at",
+        new.run_at,
+        "max_runtime_seconds",
+        new.max_runtime_seconds,
+    )
+    return stmt.on_conflict_do_update(
+        index_elements=["client_id"],
+        set_={
+            "name": unless_running(Task.name),
+            "payload": unless_running(Task.payload),
+            "priority": unless_running(Task.priority),
+            "status": unless_running(Task.status),
+            "run_at": unless_running(Task.run_at),
+            "max_runtime_seconds": unless_running(Task.max_runtime_seconds),
+            "attempts": reset_unless_running(Task.attempts, 0),
+            "started_at": reset_unless_running(Task.started_at, None),
+            "completed_at": reset_unless_running(Task.completed_at, None),
+            "error": reset_unless_running(Task.error, None),
+            "requeue": sa.case((running, requeue), else_=sa.null()),
+        },
     )
 
 
@@ -237,7 +244,7 @@ class PQ:
         _live_instances.add(self)
 
     @contextmanager
-    def session(self) -> Any:
+    def session(self) -> Iterator[Session]:
         """Get a database session context manager."""
         session = self._session_factory()
         try:
@@ -248,6 +255,38 @@ class PQ:
             raise
         finally:
             session.close()
+
+    @contextmanager
+    def _autocommit(self) -> Iterator[Session]:
+        """A session in which each statement is its own transaction.
+
+        For work that is one statement (an enqueue, a claim, the end of a
+        run): it saves the ``BEGIN`` and ``COMMIT`` round trips that
+        ``session()`` adds, which are half of what such a call sends.
+
+        Autocommit is switched on the driver's connection, the way
+        SQLAlchemy's own pre-ping does it. SQLAlchemy's ``AUTOCOMMIT``
+        isolation level would cost what it saves: with psycopg2 it sends a
+        ``SET default_transaction_isolation`` each time a pooled connection
+        enters or leaves it.
+        """
+        with self._engine.connect() as connection:
+            driver_connection = connection.connection.dbapi_connection
+            assert driver_connection is not None
+            driver_connection.autocommit = True
+            try:
+                with Session(bind=connection, expire_on_commit=False) as session:
+                    yield session
+                    # Sends nothing in autocommit. Commits for real on a
+                    # driver that ignored the attribute.
+                    session.commit()
+            finally:
+                try:
+                    driver_connection.autocommit = False
+                except Exception:
+                    # Never return a connection to the pool in autocommit:
+                    # ``session()`` would lose its transactions on it.
+                    connection.invalidate()
 
     def close(self) -> None:
         """Close all database connections and dispose the engine.
@@ -357,19 +396,20 @@ class PQ:
         if run_at is None:
             run_at = datetime.now(UTC)
 
-        task_obj = Task(
-            name=name,
-            payload=payload,
-            run_at=run_at,
-            priority=priority,
-            client_id=client_id,
-            max_runtime_seconds=max_runtime_seconds,
+        stmt = (
+            insert(Task)
+            .values(
+                name=name,
+                payload=payload,
+                run_at=run_at,
+                priority=int(priority),
+                client_id=client_id,
+                max_runtime_seconds=max_runtime_seconds,
+            )
+            .returning(Task.id)
         )
-
-        with self.session() as session:
-            session.add(task_obj)
-            session.flush()
-            return task_obj.id
+        with self._autocommit() as session:
+            return session.execute(stmt).scalar_one()
 
     def upsert(
         self,
@@ -414,7 +454,7 @@ class PQ:
             ValueError: If task is a lambda, closure, or cannot be imported,
                 or if ``max_runtime_seconds`` is not None and ``<= 0``.
         """
-        stmt = _upsert_statement(
+        row = _upsert_row(
             Upsert(
                 task=task,
                 client_id=client_id,
@@ -425,26 +465,24 @@ class PQ:
                 max_runtime_seconds=max_runtime_seconds,
             )
         )
-
-        with self.session() as session:
-            result = session.execute(stmt)
-            return result.scalar_one()
+        with self._autocommit() as session:
+            stmt = _upsert_statement().returning(Task.id)
+            return session.execute(stmt, row).scalar_one()
 
     def upsert_many(self, upserts: Sequence[Upsert]) -> list[int]:
         """Upsert several tasks in one transaction.
 
         Each item behaves like ``upsert()`` with the same arguments, so a
         RUNNING row gets the new version parked. A repeated ``client_id``
-        ends with its last version. One session and one commit for the
-        batch, against one each per ``upsert()`` call. Nothing is written
-        if any item fails.
+        ends with its last version. The batch is sent as one multi-row
+        statement per 1000 tasks, against one statement and one commit per
+        ``upsert()`` call. Nothing is written if any item fails.
 
-        The items are written in ``client_id`` order (stable, so repeated
-        ids keep input order), so that two batches with overlapping ids
-        lock rows in the same order and cannot deadlock. Each row stays
-        locked until the batch commits: a worker finishing one of these
-        tasks waits for the whole batch. Split very large batches into
-        chunks to keep that wait short.
+        The rows are written in ``client_id`` order, so that two batches
+        with overlapping ids lock rows in the same order and cannot
+        deadlock. Each row stays locked until the batch commits: a worker
+        finishing one of these tasks waits for the whole batch. Split very
+        large batches into chunks to keep that wait short.
 
         Returns:
             Task IDs, in the order of ``upserts``.
@@ -452,13 +490,21 @@ class PQ:
         Raises:
             ValueError: As ``upsert()``, for the first invalid item.
         """
-        stmts = [_upsert_statement(u) for u in upserts]
-        order = sorted(range(len(upserts)), key=lambda i: upserts[i].client_id)
-        ids = [0] * len(upserts)
+        rows = [_upsert_row(u) for u in upserts]
+        if not rows:
+            return []
+        # One statement cannot update a row twice: keep the last version of
+        # a repeated ``client_id``, which is what applying them in turn
+        # leaves behind.
+        latest = {u.client_id: row for u, row in zip(upserts, rows, strict=True)}
+        ordered = [latest[client_id] for client_id in sorted(latest)]
+        stmt = _upsert_statement().returning(Task.client_id, Task.id)
         with self.session() as session:
-            for i in order:
-                ids[i] = session.execute(stmts[i]).scalar_one()
-        return ids
+            ids = {
+                client_id: task_id
+                for client_id, task_id in session.execute(stmt, ordered)
+            }
+        return [ids[u.client_id] for u in upserts]
 
     def schedule(
         self,
@@ -476,7 +522,12 @@ class PQ:
     ) -> int:
         """Schedule a periodic task.
 
-        If a periodic task with this function already exists, it will be updated.
+        If a periodic task with this function and ``key`` already exists, it
+        is updated. Its next run stays where it was unless ``run_every`` or
+        ``cron`` changed, so calling this on every application start does
+        not run the task each time. A new schedule, one whose timing
+        changed, and one that was inactive first run now (``run_every``) or
+        at the next cron time.
         Either run_every or cron must be provided, but not both.
 
         Args:
@@ -518,6 +569,13 @@ class PQ:
             raise ValueError("Either run_every or cron must be provided")
         if run_every is not None and cron is not None:
             raise ValueError("Only one of run_every or cron can be provided")
+        if run_every is not None and not (
+            timedelta(0) <= run_every <= timedelta(seconds=_MAX_SECONDS)
+        ):
+            raise ValueError(
+                f"run_every must be between 0 and {_MAX_SECONDS} seconds"
+                f" (got {run_every!r})"
+            )
         if max_concurrent is not None and max_concurrent > 1:
             raise ValueError(
                 f"max_concurrent must be 1 or None, got {max_concurrent} "
@@ -550,39 +608,48 @@ class PQ:
         else:
             next_run = now
 
-        with self.session() as session:
-            stmt = (
-                insert(Periodic)
-                .values(
-                    name=name,
-                    key=key,
-                    payload=payload,
-                    priority=priority,
-                    run_every=run_every,
-                    cron=cron_expr,
-                    next_run=next_run,
-                    client_id=client_id,
-                    max_concurrent=max_concurrent,
-                    active=active,
-                    max_runtime_seconds=max_runtime_seconds,
-                )
-                .on_conflict_do_update(
-                    index_elements=["name", "key"],
-                    set_={
-                        "payload": payload,
-                        "priority": priority,
-                        "run_every": run_every,
-                        "cron": cron_expr,
-                        "next_run": next_run,
-                        "max_concurrent": max_concurrent,
-                        "active": active,
-                        "max_runtime_seconds": max_runtime_seconds,
-                    },
-                )
-                .returning(Periodic.id)
-            )
-            result = session.execute(stmt)
-            return result.scalar_one()
+        stmt = insert(Periodic).values(
+            name=name,
+            key=key,
+            payload=payload,
+            priority=int(priority),
+            run_every=run_every,
+            cron=cron_expr,
+            next_run=next_run,
+            client_id=client_id,
+            max_concurrent=max_concurrent,
+            active=active,
+            max_runtime_seconds=max_runtime_seconds,
+        )
+        new = stmt.excluded
+        # Workers register their schedules on every start. A schedule whose
+        # timing did not change keeps its ``next_run``: resetting it would
+        # run every interval schedule once per worker start, and would skip
+        # a cron time that came due while the workers restarted. A schedule
+        # that was switched off starts afresh: its ``next_run`` is from
+        # before the pause.
+        same_timing = sa.and_(
+            Periodic.active.is_(True),
+            Periodic.run_every.is_not_distinct_from(new.run_every),
+            Periodic.cron.is_not_distinct_from(new.cron),
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["name", "key"],
+            set_={
+                "payload": new.payload,
+                "priority": new.priority,
+                "run_every": new.run_every,
+                "cron": new.cron,
+                "next_run": sa.case(
+                    (same_timing, Periodic.next_run), else_=new.next_run
+                ),
+                "max_concurrent": new.max_concurrent,
+                "active": new.active,
+                "max_runtime_seconds": new.max_runtime_seconds,
+            },
+        ).returning(Periodic.id)
+        with self._autocommit() as session:
+            return session.execute(stmt).scalar_one()
 
     def cancel(self, task_id: int) -> bool:
         """Cancel a one-off task by ID.
@@ -593,10 +660,9 @@ class PQ:
         Returns:
             True if task was found and deleted, False otherwise.
         """
-        with self.session() as session:
+        with self._autocommit() as session:
             stmt = delete(Task).where(Task.id == task_id)
-            result = session.execute(stmt)
-            return result.rowcount > 0
+            return session.connection().execute(stmt).rowcount > 0
 
     def unschedule(self, task: Callable[..., Any] | str, *, key: str = "") -> bool:
         """Remove a periodic task.
@@ -611,14 +677,13 @@ class PQ:
             True if task was found and deleted, False otherwise.
         """
         name = task if isinstance(task, str) else get_function_path(task)
-        with self.session() as session:
+        with self._autocommit() as session:
             stmt = delete(Periodic).where(Periodic.name == name, Periodic.key == key)
-            result = session.execute(stmt)
-            return result.rowcount > 0
+            return session.connection().execute(stmt).rowcount > 0
 
     def pending_count(self) -> int:
         """Count pending one-off tasks."""
-        with self.session() as session:
+        with self._autocommit() as session:
             result = session.execute(
                 select(func.count())
                 .select_from(Task)
@@ -628,7 +693,7 @@ class PQ:
 
     def periodic_count(self) -> int:
         """Count periodic task schedules."""
-        with self.session() as session:
+        with self._autocommit() as session:
             result = session.execute(select(func.count()).select_from(Periodic))
             return result.scalar_one()
 
@@ -641,7 +706,7 @@ class PQ:
         Returns:
             Task object or None if not found.
         """
-        with self.session() as session:
+        with self._autocommit() as session:
             task = session.get(Task, task_id)
             if task:
                 session.expunge(task)
@@ -656,7 +721,7 @@ class PQ:
         Returns:
             Task object or None if not found.
         """
-        with self.session() as session:
+        with self._autocommit() as session:
             stmt = select(Task).where(Task.client_id == client_id)
             task = session.execute(stmt).scalar_one_or_none()
             if task:
@@ -672,7 +737,7 @@ class PQ:
         Returns:
             Periodic object or None if not found.
         """
-        with self.session() as session:
+        with self._autocommit() as session:
             stmt = select(Periodic).where(Periodic.client_id == client_id)
             periodic = session.execute(stmt).scalar_one_or_none()
             if periodic:
@@ -688,7 +753,7 @@ class PQ:
         Returns:
             List of failed tasks, most recent first.
         """
-        with self.session() as session:
+        with self._autocommit() as session:
             stmt = (
                 select(Task)
                 .where(Task.status == TaskStatus.FAILED)
@@ -709,7 +774,7 @@ class PQ:
         Returns:
             List of completed tasks, most recent first.
         """
-        with self.session() as session:
+        with self._autocommit() as session:
             stmt = (
                 select(Task)
                 .where(Task.status == TaskStatus.COMPLETED)
@@ -730,12 +795,11 @@ class PQ:
         Returns:
             Number of tasks deleted.
         """
-        with self.session() as session:
+        with self._autocommit() as session:
             stmt = delete(Task).where(Task.status == TaskStatus.COMPLETED)
             if before is not None:
                 stmt = stmt.where(Task.completed_at < before)
-            result = session.execute(stmt)
-            return result.rowcount
+            return session.connection().execute(stmt).rowcount
 
     def clear_failed(self, before: datetime | None = None) -> int:
         """Clear failed tasks.
@@ -746,12 +810,11 @@ class PQ:
         Returns:
             Number of tasks deleted.
         """
-        with self.session() as session:
+        with self._autocommit() as session:
             stmt = delete(Task).where(Task.status == TaskStatus.FAILED)
             if before is not None:
                 stmt = stmt.where(Task.completed_at < before)
-            result = session.execute(stmt)
-            return result.rowcount
+            return session.connection().execute(stmt).rowcount
 
     def reap_stale_tasks(self, threshold: timedelta) -> int:
         """Mark stale RUNNING tasks as FAILED, or re-queue them.
@@ -783,7 +846,6 @@ class PQ:
         Returns:
             Number of tasks reaped (failed plus re-queued).
         """
-        now = datetime.now(UTC)
         threshold_seconds = threshold.total_seconds()
         # Per-row effective stale window: the larger of the supplied
         # default and 2x the row's per-task override (NULL → just the
@@ -819,58 +881,42 @@ class PQ:
             sa.func.coalesce(sa.cast(Task.max_runtime_seconds, sa.String), "NULL"),
             effective_threshold_seconds,
         )
-        with self.session() as session:
-            stmt = (
-                update(Task)
-                .where(
-                    Task.status == TaskStatus.RUNNING,
-                    Task.started_at < stale_cutoff,
-                    Task.requeue.is_(None),
-                )
-                .values(
-                    status=TaskStatus.FAILED,
-                    completed_at=now,
-                    error=per_row_error,
-                )
-                .returning(
-                    Task.id,
-                    Task.name,
-                    Task.started_at,
-                    Task.max_runtime_seconds,
-                )
+        stale = (Task.status == TaskStatus.RUNNING, Task.started_at < stale_cutoff)
+        fail = (
+            update(Task)
+            .where(*stale, Task.requeue.is_(None))
+            .values(
+                status=TaskStatus.FAILED,
+                completed_at=func.now(),
+                error=per_row_error,
             )
-            reaped = list(session.execute(stmt).all())
-            for task_id, name, started_at, max_runtime_seconds in reaped:
-                logger.warning(
-                    f"Reaped stale task '{name}' (id={task_id},"
-                    f" started_at={started_at},"
-                    f" max_runtime_seconds={max_runtime_seconds})"
-                )
-
-            # Stale rows with a parked upsert: re-queue them with the
-            # parked version. ``FOR UPDATE`` serializes with a concurrent
-            # ``upsert()`` (which may replace ``requeue``) and with the
-            # worker's own end-of-run update.
-            requeued = list(
-                session.execute(
-                    select(Task)
-                    .where(
-                        Task.status == TaskStatus.RUNNING,
-                        Task.started_at < stale_cutoff,
-                        Task.requeue.is_not(None),
-                    )
-                    .with_for_update()
-                ).scalars()
+            .returning(Task.id, Task.name, Task.started_at, Task.max_runtime_seconds)
+        )
+        # Stale rows with a parked upsert are re-queued with the parked
+        # version. A row is matched by one of the two statements under its
+        # row lock, so an ``upsert()`` that parks a version in between
+        # decides which one.
+        requeue = (
+            update(Task)
+            .where(*stale, Task.requeue.is_not(None))
+            .values(requeue_values())
+            .returning(Task.id, Task.name)
+        )
+        with self._autocommit() as session:
+            failed = session.execute(fail).all()
+            requeued = session.execute(requeue).all()
+        for task_id, name, started_at, max_runtime_seconds in failed:
+            logger.warning(
+                f"Reaped stale task '{name}' (id={task_id},"
+                f" started_at={started_at},"
+                f" max_runtime_seconds={max_runtime_seconds})"
             )
-            for task in requeued:
-                logger.warning(
-                    f"Reaped stale task '{task.name}' (id={task.id},"
-                    f" started_at={task.started_at},"
-                    f" max_runtime_seconds={task.max_runtime_seconds});"
-                    " re-queued by a parked upsert"
-                )
-                task.apply_requeue()
-            return len(reaped) + len(requeued)
+        for task_id, name in requeued:
+            logger.warning(
+                f"Reaped stale task (id={task_id}); re-queued as '{name}'"
+                " by a parked upsert"
+            )
+        return len(failed) + len(requeued)
 
     def run_worker(
         self,
