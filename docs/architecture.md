@@ -112,7 +112,7 @@ The parent monitors the child via `wait4()` and detects:
 |----------------|-----------|--------|
 | Success | Exit code 0 | `COMPLETED` |
 | Exception | Exit code 1 + pipe message | `FAILED` with error |
-| Timeout | Exit code 124 or SIGALRM | `FAILED` with timeout |
+| Timeout | Exit code 124 (the child stopped itself), or the worker's SIGKILL 10 s after `max_runtime` | `FAILED` with timeout |
 | OOM | SIGKILL (signal 9) | `FAILED` with OOM |
 | Crash | Other signals | `FAILED` with signal |
 
@@ -169,16 +169,26 @@ flowchart LR
 ```
 
 ```sql
-SELECT * FROM pq_tasks
-WHERE status = 'pending' AND run_at <= now()
-ORDER BY priority DESC, run_at
-FOR UPDATE SKIP LOCKED
-LIMIT 1;
+UPDATE pq_tasks
+SET status = 'RUNNING', started_at = now(), attempts = attempts + 1
+WHERE id = (
+    SELECT id FROM pq_tasks
+    WHERE status = 'PENDING' AND run_at <= now()
+    ORDER BY priority DESC, run_at
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING *;
 ```
 
 - `FOR UPDATE` locks the selected row
 - `SKIP LOCKED` skips rows locked by other workers
 - Each task runs exactly once
+- The partial index `ix_pq_tasks_pending` holds the pending rows in this order, so a claim reads its first entry however long the backlog is
+
+One-off tasks and periodic schedules form one queue: priority first, then the time they came due. Before the claim above, the worker reads the first due schedule. If there is one, the task is claimed only if it goes before it; otherwise the schedule is claimed, in a transaction that locks it and advances it to its next run.
+
+Claiming a task, recording its result and enqueuing are one statement each, sent in autocommit: no `BEGIN` and `COMMIT` round trips. A poll that finds nothing costs three statements (connection check, read of the schedules, claim), a processed task five, an enqueue two.
 
 ## Priority System
 
@@ -215,7 +225,7 @@ flowchart TD
     input --> json
     json -->|"Yes"| payload
     json -->|"No"| pydantic
-    pydantic -->|"model_dump()"| payload
+    pydantic -->|"model_dump(mode='json')"| payload
     pydantic -->|"No"| dill
     dill --> payload
 ```
@@ -223,8 +233,8 @@ flowchart TD
 | Type | Method |
 |------|--------|
 | str, int, list, dict, None | JSON |
-| Pydantic models | `model_dump()` → JSON |
-| Lambdas, closures, custom objects | dill (pickle-like) |
+| Pydantic models | `model_dump(mode="json")` → JSON |
+| Lambdas, closures, custom objects, and values JSONB rejects (`NaN`, a NUL character in a string) | dill (pickle-like) |
 
 ## Task Lifecycle
 

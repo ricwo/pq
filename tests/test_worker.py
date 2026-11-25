@@ -1298,7 +1298,7 @@ class TestStaleReaperRace:
         # 3. Now simulate what Phase 3 does: try to update WHERE status = RUNNING
         #    This should be a no-op because status is already FAILED
         with pq.session() as session:
-            result = session.execute(
+            result = session.connection().execute(
                 sa_update(Task)
                 .where(Task.id == task_id, Task.status == TaskStatus.RUNNING)
                 .values(

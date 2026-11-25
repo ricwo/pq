@@ -866,10 +866,8 @@ class TestUpsertMany:
                 [
                     Upsert(task=upsert_handler, kwargs={"value": 1}, client_id="a"),
                     Upsert(task=upsert_handler, kwargs={"value": 1}, client_id="b"),
-                    # JSONB rejects \u0000: fails in Postgres, after "a" and "b".
-                    Upsert(
-                        task=upsert_handler, kwargs={"value": "\x00"}, client_id="c"
-                    ),
+                    # Longer than the column: fails in Postgres, after "a" and "b".
+                    Upsert(task=upsert_handler, client_id="c" * 256),
                 ]
             )
 
