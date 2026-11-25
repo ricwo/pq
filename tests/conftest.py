@@ -1,5 +1,6 @@
 """Pytest fixtures for PQ tests."""
 
+import importlib.resources
 import multiprocessing
 import multiprocessing.managers
 import os
@@ -7,6 +8,8 @@ from collections.abc import Generator
 from typing import TYPE_CHECKING
 
 import pytest
+from alembic import command
+from alembic.config import Config
 from loguru import logger
 from sqlalchemy import text
 
@@ -59,6 +62,22 @@ def _clean_pq(url: str) -> Generator[PQ, None, None]:
 def pq(db_url: str) -> Generator[PQ, None, None]:
     """PQ client with clean database for each test."""
     yield from _clean_pq(db_url)
+
+
+@pytest.fixture
+def alembic_cfg(pq: PQ, db_url: str) -> Config:
+    """Alembic config for the test database, stamped at head.
+
+    The ``pq`` fixture uses ``create_tables()``, which bypasses Alembic, so
+    the history is stamped to match the schema before a test migrates it.
+    """
+    cfg = Config()
+    cfg.set_main_option(
+        "script_location", str(importlib.resources.files("pq.migrations"))
+    )
+    cfg.set_main_option("sqlalchemy.url", db_url)
+    command.stamp(cfg, "head")
+    return cfg
 
 
 @pytest.fixture

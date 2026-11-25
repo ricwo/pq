@@ -188,13 +188,21 @@ def requeue_values() -> dict[str, ColumnElement[Any]]:
         # Cast: in a ``CASE`` next to another literal, Postgres would type a
         # bare ``'PENDING'`` as text, which the enum column does not accept.
         "status": cast(literal_column("'PENDING'"), Task.status.type),
+        "requeue": null(),
+        **fresh_run_values(),
+    }
+
+
+def fresh_run_values() -> dict[str, ColumnElement[Any]]:
+    """``UPDATE`` values that clear every trace of earlier runs, for a row
+    that goes back to PENDING (``requeue_values``, ``upsert()``)."""
+    return {
         "attempts": literal_column("0"),
         "started_at": null(),
         "completed_at": null(),
         "error": null(),
-        "requeue": null(),
-        **run_ended_values(),
         "failure_kind": cast(null(), Task.failure_kind.type),
+        **run_ended_values(),
     }
 
 

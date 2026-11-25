@@ -26,9 +26,6 @@ def __getattr__(name: str) -> type[Exception]:
     if name == "TaskTimeoutError":
         from pq import worker
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            deprecated = worker.TaskTimeoutError
         warnings.warn(
             "pq.TaskTimeoutError is deprecated and will be removed: pq never"
             " raises it. A task that timed out has"
@@ -36,5 +33,5 @@ def __getattr__(name: str) -> type[Exception]:
             DeprecationWarning,
             stacklevel=2,
         )
-        return deprecated
+        return worker._TaskTimeoutError
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

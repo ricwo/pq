@@ -3,6 +3,7 @@
 from collections.abc import Callable
 
 import pytest
+from alembic.config import Config
 from croniter import croniter
 from datetime import UTC, datetime, timedelta
 from sqlalchemy.exc import IntegrityError
@@ -1753,24 +1754,13 @@ class TestMigrationAppliesOnPopulatedTables:
     """
 
     def test_migration_downgrade_then_upgrade_preserves_rows(
-        self, pq: PQ, db_url: str
+        self, pq: PQ, alembic_cfg: Config
     ) -> None:
         from alembic import command
-        from alembic.config import Config
-        import importlib.resources
 
         from pq.models import TaskStatus
 
-        migrations_pkg = importlib.resources.files("pq.migrations")
-        cfg = Config()
-        cfg.set_main_option("script_location", str(migrations_pkg))
-        cfg.set_main_option("sqlalchemy.url", db_url)
-
-        # The ``pq`` fixture uses ``create_tables()`` (which bypasses
-        # Alembic), so the ``pq_schema_version`` tracking table doesn't
-        # exist yet. Stamp at head so the migration history matches the
-        # schema before we exercise the downgrade → upgrade cycle.
-        command.stamp(cfg, "head")
+        cfg = alembic_cfg
 
         # The schema gets downgraded mid-test. Wrap the whole flow in
         # try/finally so a failed assertion below doesn't leave the
@@ -1854,21 +1844,15 @@ class TestRequeueMigrationAppliesOnPopulatedTables:
     cleanly."""
 
     def test_migration_downgrade_then_upgrade_preserves_rows(
-        self, pq: PQ, db_url: str
+        self, pq: PQ, alembic_cfg: Config
     ) -> None:
         from alembic import command
-        from alembic.config import Config
-        import importlib.resources
 
         from sqlalchemy import inspect, select, text
 
         from pq.models import TaskStatus
 
-        migrations_pkg = importlib.resources.files("pq.migrations")
-        cfg = Config()
-        cfg.set_main_option("script_location", str(migrations_pkg))
-        cfg.set_main_option("sqlalchemy.url", db_url)
-        command.stamp(cfg, "head")
+        cfg = alembic_cfg
 
         def task_columns() -> set[str]:
             with pq.session() as session:

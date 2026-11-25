@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from alembic.config import Config
 from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 
@@ -24,14 +25,17 @@ from pq.client import PQ
 from pq.models import FailureKind, Periodic, Task, TaskStatus, Worker
 from pq.worker import _ChildResult, _Heartbeat
 
-from tests.test_audit import REPO_ROOT, _is_gone, _sigterm_self_after, _task
+from tests.test_audit import (
+    REPO_ROOT,
+    _is_gone,
+    _sigterm_self_after,
+    _task,
+    noop,
+    sleep_then_touch,
+)
 
 
 # --- Handlers (module level: the worker imports them by path) ---
-
-
-def noop() -> None:
-    pass
 
 
 def fail() -> None:
@@ -40,11 +44,6 @@ def fail() -> None:
 
 def sleep_for(seconds: float) -> None:
     time.sleep(seconds)
-
-
-def sleep_then_touch(path: str, seconds: float) -> None:
-    time.sleep(seconds)
-    Path(path).write_text("done")
 
 
 def signal_self(signum: int) -> None:
@@ -714,22 +713,14 @@ class TestCheckConstraints:
 
 class TestMigration:
     def test_upgrade_on_populated_tables_and_downgrade(
-        self, pq: PQ, db_url: str
+        self, pq: PQ, alembic_cfg: Config
     ) -> None:
         """The migration applies to tables that hold rows, including a row
         that breaks one of the new constraints, and downgrades cleanly."""
-        import importlib.resources
-
         from alembic import command
-        from alembic.config import Config
         from sqlalchemy import inspect as sa_inspect
 
-        cfg = Config()
-        cfg.set_main_option(
-            "script_location", str(importlib.resources.files("pq.migrations"))
-        )
-        cfg.set_main_option("sqlalchemy.url", db_url)
-        command.stamp(cfg, "head")
+        cfg = alembic_cfg
 
         def schema() -> tuple[set[str], set[str], set[str]]:
             with pq.session() as session:

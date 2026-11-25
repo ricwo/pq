@@ -290,7 +290,6 @@ class _ShutdownState:
     process; ``run_worker`` resets it on entry.
     """
 
-    requested: bool = False
     signum: int | None = None  # the signal that asked, None for stop_worker()
     deadline: float | None = None  # time.monotonic() deadline, set by request
     drain_timeout: float = DEFAULT_DRAIN_TIMEOUT
@@ -300,8 +299,11 @@ class _ShutdownState:
     wake_r: int | None = None
     wake_w: int | None = None
 
+    @property
+    def requested(self) -> bool:
+        return self.deadline is not None
+
     def reset(self, drain_timeout: float) -> None:
-        self.requested = False
         self.signum = None
         self.deadline = None
         self.drain_timeout = drain_timeout
@@ -313,9 +315,9 @@ class _ShutdownState:
         change nothing, so they cannot abandon the remaining children."""
         if self.requested:
             return
-        self.deadline = time.monotonic() + self.drain_timeout
         self.signum = signum
-        self.requested = True
+        # Last: setting the deadline is what makes ``requested`` true.
+        self.deadline = time.monotonic() + self.drain_timeout
         if self.wake_w is not None:
             try:
                 os.write(self.wake_w, b"\0")
@@ -324,9 +326,7 @@ class _ShutdownState:
 
     def deadline_passed(self) -> bool:
         """True once shutdown was requested and the drain budget is spent."""
-        if not self.requested:
-            return False
-        return self.deadline is None or time.monotonic() >= self.deadline
+        return self.deadline is not None and time.monotonic() >= self.deadline
 
     def log_request(self) -> None:
         """Log the shutdown request once, from the worker loop.
@@ -786,18 +786,19 @@ def _poll_child(child: _Child) -> _ChildResult | None:
     _read_output(child)
     _close_output(child)
 
-    if os.WIFEXITED(raw_status) and os.WEXITSTATUS(raw_status) == EXIT_TIMEOUT:
+    exit_code = os.WEXITSTATUS(raw_status) if os.WIFEXITED(raw_status) else None
+    if exit_code == EXIT_TIMEOUT:
         # The child stopped itself. What it started and left running is
         # past the deadline too.
         _kill_child_group(child.pid, reaped=True)
 
-    if os.WIFEXITED(raw_status) and os.WEXITSTATUS(raw_status) == EXIT_SUCCESS:
+    if exit_code == EXIT_SUCCESS:
         return _ChildResult(None)
 
     # What the child wrote is how its handler ended, and that is the result
     # of the task. How the process ended after that, in the post-execute
     # hook or on its way out, does not change it.
-    if child.output and not os.WIFEXITED(raw_status):
+    if child.output and exit_code is None:
         logger.warning(
             f"Task '{child.claim.row.name}' had finished, but its process was"
             " killed afterwards (post_execute overran, or a signal from"
@@ -830,8 +831,7 @@ def _poll_child(child: _Child) -> _ChildResult | None:
             )
         return _ChildResult(FailureKind.KILLED, f"Task killed by signal {signal_num}")
 
-    if os.WIFEXITED(raw_status):
-        exit_code = os.WEXITSTATUS(raw_status)
+    if exit_code is not None:
         if exit_code == EXIT_TIMEOUT:
             return _ChildResult(FailureKind.TIMEOUT, "Task exceeded max runtime")
         return _ChildResult(

@@ -28,8 +28,8 @@ from pq.models import (
     Periodic,
     Task,
     TaskStatus,
-    requeue_values,
-    run_ended_values,
+    end_run_values,
+    fresh_run_values,
 )
 from pq.priority import Priority
 from pq.registry import get_function_path
@@ -220,11 +220,6 @@ def _upsert_statement() -> Insert:
     def unless_running[T](column: InstrumentedAttribute[T]) -> sa.ColumnElement[T]:
         return sa.case((running, column), else_=new[column.key])
 
-    def reset_unless_running[T](
-        column: InstrumentedAttribute[T], value: T
-    ) -> sa.ColumnElement[T]:
-        return sa.case((running, column), else_=value)
-
     # ``run_at`` goes into the JSON as ``timestamptz``, so Postgres writes it
     # as ISO 8601 with an offset: the instant the direct path stores, whatever
     # the time zone of the session that applies the version later.
@@ -249,15 +244,10 @@ def _upsert_statement() -> Insert:
             "status": unless_running(Task.status),
             "run_at": unless_running(Task.run_at),
             "max_runtime_seconds": unless_running(Task.max_runtime_seconds),
-            "attempts": reset_unless_running(Task.attempts, 0),
-            "started_at": reset_unless_running(Task.started_at, None),
-            "completed_at": reset_unless_running(Task.completed_at, None),
-            "error": reset_unless_running(Task.error, None),
-            "failure_kind": reset_unless_running(Task.failure_kind, None),
-            "worker_id": reset_unless_running(Task.worker_id, None),
-            "claimed_max_runtime_seconds": reset_unless_running(
-                Task.claimed_max_runtime_seconds, None
-            ),
+            **{
+                column: sa.case((running, Task.__table__.c[column]), else_=fresh)
+                for column, fresh in fresh_run_values().items()
+            },
             "requeue": sa.case((running, requeue), else_=sa.null()),
         },
     )
@@ -913,44 +903,41 @@ class PQ:
             sa.func.coalesce(sa.cast(run_max_runtime, sa.String), "NULL"),
             effective_threshold_seconds,
         )
-        stale = (Task.status == TaskStatus.RUNNING, Task.started_at < stale_cutoff)
-        fail = (
-            update(Task)
-            .where(*stale, Task.requeue.is_(None))
-            .values(
-                status=TaskStatus.FAILED,
-                completed_at=func.now(),
-                error=per_row_error,
-                failure_kind=FailureKind.STALE,
-                **run_ended_values(),
-            )
-            .returning(Task.id, Task.name, Task.started_at, Task.max_runtime_seconds)
-        )
+        closed = {
+            "status": sa.cast(TaskStatus.FAILED.name, Task.status.type),
+            "completed_at": func.now(),
+            "error": per_row_error,
+            "failure_kind": sa.cast(FailureKind.STALE.value, Task.failure_kind.type),
+        }
         # Stale rows with a parked upsert are re-queued with the parked
-        # version. A row is matched by one of the two statements under its
-        # row lock, so an ``upsert()`` that parks a version in between
-        # decides which one.
-        requeue = (
+        # version, picked per row under its row lock (``end_run_values``).
+        reap = (
             update(Task)
-            .where(*stale, Task.requeue.is_not(None))
-            .values(requeue_values())
-            .returning(Task.id, Task.name)
+            .where(Task.status == TaskStatus.RUNNING, Task.started_at < stale_cutoff)
+            .values(end_run_values(closed))
+            .returning(
+                Task.id,
+                Task.name,
+                Task.status,
+                Task.started_at,
+                Task.max_runtime_seconds,
+            )
         )
         with self._autocommit() as session:
-            failed = session.execute(fail).all()
-            requeued = session.execute(requeue).all()
-        for task_id, name, started_at, max_runtime_seconds in failed:
-            logger.warning(
-                f"Reaped stale task '{name}' (id={task_id},"
-                f" started_at={started_at},"
-                f" max_runtime_seconds={max_runtime_seconds})"
-            )
-        for task_id, name in requeued:
-            logger.warning(
-                f"Reaped stale task (id={task_id}); re-queued as '{name}'"
-                " by a parked upsert"
-            )
-        return len(failed) + len(requeued)
+            reaped = session.execute(reap).all()
+        for task_id, name, status, started_at, max_runtime_seconds in reaped:
+            if status == TaskStatus.PENDING:
+                logger.warning(
+                    f"Reaped stale task (id={task_id}); re-queued as '{name}'"
+                    " by a parked upsert"
+                )
+            else:
+                logger.warning(
+                    f"Reaped stale task '{name}' (id={task_id},"
+                    f" started_at={started_at},"
+                    f" max_runtime_seconds={max_runtime_seconds})"
+                )
+        return len(reaped)
 
     def run_worker(
         self,
