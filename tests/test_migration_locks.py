@@ -10,12 +10,13 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import make_url, text
+from alembic.script import ScriptDirectory
+from sqlalchemy import create_engine, make_url, text
 
 from pq.client import PQ
 from pq.migrations import MIGRATION_LOCK_KEY
@@ -37,15 +38,21 @@ class _Scratch:
     pq: PQ
     url: str
     cfg: Config
+    migrators: list[subprocess.Popen[str]] = field(default_factory=list)
 
     def migrator(self) -> subprocess.Popen[str]:
-        """Start a process that runs ``run_db_migrations()``."""
-        return subprocess.Popen(
+        """Start a process that runs ``run_db_migrations()``.
+
+        The fixture kills it at the end of the test.
+        """
+        process = subprocess.Popen(
             [sys.executable, "-c", _MIGRATE, self.url],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
+        self.migrators.append(process)
+        return process
 
     def waiting(self) -> int:
         """Backends of this database that wait for a lock."""
@@ -58,35 +65,48 @@ class _Scratch:
                 )
             ).scalar_one()
 
+    def wait_until_all_wait(self, migrators: list[subprocess.Popen[str]]) -> None:
+        """Wait until every migrator waits for a lock, or one has exited."""
+        _wait_until(
+            lambda: (
+                self.waiting() == len(migrators)
+                or any(m.poll() is not None for m in migrators)
+            )
+        )
+
     def version(self) -> str | None:
         with self.pq.session() as session:
             return session.execute(
                 text("SELECT version_num FROM pq_schema_version")
             ).scalar_one_or_none()
 
+    def head(self) -> str | None:
+        return ScriptDirectory.from_config(self.cfg).get_current_head()
+
 
 @pytest.fixture
-def scratch(pq: PQ, db_url: str) -> Generator[_Scratch, None, None]:
+def scratch(db_url: str) -> Generator[_Scratch, None, None]:
     database = f"pq_migration_locks_{uuid.uuid4().hex[:12]}"
     url = make_url(db_url).set(database=database).render_as_string(False)
-    with pq._engine.connect().execution_options(
-        isolation_level="AUTOCOMMIT"
-    ) as connection:
+    admin = create_engine(db_url, isolation_level="AUTOCOMMIT")
+    with admin.connect() as connection:
         connection.execute(text(f"CREATE DATABASE {database}"))
     cfg = Config()
     cfg.set_main_option(
         "script_location", str(importlib.resources.files("pq.migrations"))
     )
     cfg.set_main_option("sqlalchemy.url", url)
-    client = PQ(url)
+    result = _Scratch(PQ(url), url, cfg)
     try:
-        yield _Scratch(client, url, cfg)
+        yield result
     finally:
-        client.close()
-        with pq._engine.connect().execution_options(
-            isolation_level="AUTOCOMMIT"
-        ) as connection:
+        for migrator in result.migrators:
+            migrator.kill()
+            migrator.wait()
+        result.pq.close()
+        with admin.connect() as connection:
             connection.execute(text(f"DROP DATABASE IF EXISTS {database} (FORCE)"))
+        admin.dispose()
 
 
 def _wait_until(condition: Callable[[], bool], timeout: float = 30) -> None:
@@ -108,39 +128,23 @@ def _finish(migrators: list[subprocess.Popen[str]]) -> list[tuple[int, str]]:
     return results
 
 
-def _head(cfg: Config) -> str | None:
-    from alembic.script import ScriptDirectory
-
-    return ScriptDirectory.from_config(cfg).get_current_head()
-
-
 class TestMigratingAtOnce:
     def test_on_an_empty_database(self, scratch: _Scratch) -> None:
         """The first deploy: every worker finds no tables and creates them."""
-        migrators: list[subprocess.Popen[str]] = []
-        try:
-            # Held here until every migrator has seen the empty database and
-            # waits for its turn.
-            with scratch.pq.session() as holder:
-                holder.execute(
-                    text("SELECT pg_advisory_xact_lock(:key)"),
-                    {"key": MIGRATION_LOCK_KEY},
-                )
-                migrators = [scratch.migrator() for _ in range(6)]
-                _wait_until(
-                    lambda: (
-                        scratch.waiting() == len(migrators)
-                        or any(m.poll() is not None for m in migrators)
-                    )
-                )
-                assert scratch.waiting() == len(migrators)
-            results = _finish(migrators)
-        finally:
-            for migrator in migrators:
-                migrator.kill()
+        # Held here until every migrator has seen the empty database and
+        # waits for its turn.
+        with scratch.pq.session() as holder:
+            holder.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"),
+                {"key": MIGRATION_LOCK_KEY},
+            )
+            migrators = [scratch.migrator() for _ in range(6)]
+            scratch.wait_until_all_wait(migrators)
+            assert scratch.waiting() == len(migrators)
+        results = _finish(migrators)
 
         assert [code for code, _ in results] == [0] * 6, results
-        assert scratch.version() == _head(scratch.cfg)
+        assert scratch.version() == scratch.head()
         with scratch.pq.session() as session:
             session.execute(text(_INSERT_TASK), {"client_id": "after"})
 
@@ -148,26 +152,16 @@ class TestMigratingAtOnce:
         """A release with a migration: every worker pod starts with the old
         schema in place and runs the migration."""
         command.upgrade(scratch.cfg, BEFORE_INDEXES)
-        migrators: list[subprocess.Popen[str]] = []
-        try:
-            # A reader keeps every migrator from its table lock until all of
-            # them are inside the migration.
-            with scratch.pq.session() as reader:
-                reader.execute(text("SELECT count(*) FROM pq_tasks"))
-                migrators = [scratch.migrator() for _ in range(6)]
-                _wait_until(
-                    lambda: (
-                        scratch.waiting() == len(migrators)
-                        or any(m.poll() is not None for m in migrators)
-                    )
-                )
-            results = _finish(migrators)
-        finally:
-            for migrator in migrators:
-                migrator.kill()
+        # A reader keeps every migrator from its table lock until all of
+        # them are inside the migration.
+        with scratch.pq.session() as reader:
+            reader.execute(text("SELECT count(*) FROM pq_tasks"))
+            migrators = [scratch.migrator() for _ in range(6)]
+            scratch.wait_until_all_wait(migrators)
+        results = _finish(migrators)
 
         assert [code for code, _ in results] == [0] * 6, results
-        assert scratch.version() == _head(scratch.cfg)
+        assert scratch.version() == scratch.head()
 
 
 class TestMigratingNextToATransaction:
@@ -175,42 +169,29 @@ class TestMigratingNextToATransaction:
         """A transaction that read ``pq_tasks`` before the migration started
         and writes to it while the migration waits. Both finish."""
         command.upgrade(scratch.cfg, BEFORE_INDEXES)
-        migrator: subprocess.Popen[str] | None = None
-        try:
-            with scratch.pq.session() as session:
-                session.execute(text("SET LOCAL lock_timeout = '20s'"))
-                session.execute(text("SELECT count(*) FROM pq_tasks"))
-                migrator = scratch.migrator()
-                started = migrator
-                _wait_until(
-                    lambda: scratch.waiting() == 1 or started.poll() is not None
-                )
-                assert scratch.waiting() == 1
-                # The migration waits for this transaction. The transaction
-                # does not wait for the migration.
-                session.execute(text(_INSERT_TASK), {"client_id": "during"})
-                assert migrator.poll() is None
-            ((code, output),) = _finish([migrator])
-        finally:
-            if migrator is not None:
-                migrator.kill()
+        with scratch.pq.session() as session:
+            session.execute(text("SET LOCAL lock_timeout = '20s'"))
+            session.execute(text("SELECT count(*) FROM pq_tasks"))
+            migrator = scratch.migrator()
+            scratch.wait_until_all_wait([migrator])
+            assert scratch.waiting() == 1
+            # The migration waits for this transaction. The transaction
+            # does not wait for the migration.
+            session.execute(text(_INSERT_TASK), {"client_id": "during"})
+            assert migrator.poll() is None
+        ((code, output),) = _finish([migrator])
 
         assert code == 0, output
-        assert scratch.version() == _head(scratch.cfg)
+        assert scratch.version() == scratch.head()
         assert scratch.pq.get_task_by_client_id("during") is not None
 
     def test_takes_no_lock_when_nothing_is_pending(self, scratch: _Scratch) -> None:
         """A worker start on a current schema does not wait for a transaction
         that uses ``pq_tasks``, and so does not hold up the queue behind it."""
         command.upgrade(scratch.cfg, "head")
-        migrator: subprocess.Popen[str] | None = None
-        try:
-            with scratch.pq.session() as session:
-                session.execute(text(_INSERT_TASK), {"client_id": "open"})
-                migrator = scratch.migrator()
-                output, _ = migrator.communicate(timeout=30)
-        finally:
-            if migrator is not None:
-                migrator.kill()
+        with scratch.pq.session() as session:
+            session.execute(text(_INSERT_TASK), {"client_id": "open"})
+            migrator = scratch.migrator()
+            output, _ = migrator.communicate(timeout=30)
 
         assert migrator.returncode == 0, output

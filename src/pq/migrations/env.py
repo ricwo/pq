@@ -22,9 +22,9 @@ target_metadata = Base.metadata
 # Custom version table name to match pq_ naming convention
 VERSION_TABLE = "pq_schema_version"
 
-# Locked before a migration, in this order. A worker statement that reads two
-# of them takes them in the same order.
-_LOCKED_TABLES = ("pq_periodic", "pq_tasks", "pq_workers")
+# The tables of the models, locked before a migration in name order. A worker
+# statement that reads two of them takes them in the same order.
+_LOCKED_TABLES = sorted(target_metadata.tables)
 
 
 def _will_migrate() -> bool:
