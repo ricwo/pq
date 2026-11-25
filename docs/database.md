@@ -13,6 +13,12 @@ pq.run_db_migrations()
 
 This is safe to call multiple times - only pending migrations are applied.
 
+It is also safe to call from many processes at once, for example from every worker as it starts. One process migrates at a time: it holds a Postgres advisory lock (key `pq.migrations.MIGRATION_LOCK_KEY`) and an `ACCESS EXCLUSIVE` lock on the pq tables until its transaction ends. The others wait and then find nothing to apply.
+
+While a migration runs, the pq tables can be neither read nor written, so workers and `enqueue()` calls wait for it. The migration waits in turn for every transaction that already uses a pq table, and new statements on that table queue behind it. Keep transactions that touch the pq tables short during a deploy.
+
+A call that finds the schema current takes none of these locks.
+
 ## Tables
 
 pq creates four tables with the `pq_` prefix:
