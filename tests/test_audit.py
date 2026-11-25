@@ -381,14 +381,23 @@ class TestChildProcess:
         """Freezing in the worker around each fork (instead of in the child)
         moved everything the worker had allocated out of the collector's
         reach, so its cyclic garbage was never freed."""
-        gc.collect()
-        for _ in range(20):
-            garbage = [Cycle() for _ in range(500)]
-            del garbage
-            pq.enqueue(noop)
-            pq.run_worker_once()
-        left = sum(1 for o in gc.get_objects() if isinstance(o, Cycle))
-        assert left < 5000  # of 10,000; all of them stayed before the fix
+
+        def left_after(*, run_worker: bool) -> int:
+            gc.collect()
+            for _ in range(20):
+                garbage = [Cycle() for _ in range(500)]
+                del garbage
+                if run_worker:
+                    pq.enqueue(noop)
+                    pq.run_worker_once()
+            return sum(1 for o in gc.get_objects() if isinstance(o, Cycle))
+
+        # When the collector runs depends on the Python version: 3.14.0 to
+        # 3.14.4 collect incrementally and free nothing this early. So the
+        # worker is compared with the same garbage made without one. Before
+        # the fix all 10,000 stayed where the baseline is a few hundred.
+        baseline = left_after(run_worker=False)
+        assert left_after(run_worker=True) <= baseline + 4000
 
     def test_huge_error_is_truncated(self, pq: PQ) -> None:
         task_id = pq.enqueue(raise_huge_error)
