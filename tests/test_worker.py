@@ -818,37 +818,43 @@ class TestConcurrentWorker:
         concurrency: int = 3,
         max_runtime: float = 30,
         poll_interval: float = 0.1,
+        priorities: set[Priority] | None = None,
     ) -> tuple[int, int]:
-        """Fork a child running _run_concurrent. Returns (child_pid, parent_pid).
+        """Fork a child running the worker. Returns (child_pid, parent_pid).
 
         Creates a fresh PQ instance in the child to avoid sharing
         the parent's connection pool across fork.
+
+        The child runs ``run_worker``, which handles SIGINT by draining.
+        Running ``_run_concurrent`` directly made SIGINT a
+        ``KeyboardInterrupt`` at whatever the worker was doing: between a
+        fork and noting the child down, it lost track of a running task and
+        left its row RUNNING.
 
         Caller must eventually os.kill(pid, SIGINT) and os.waitpid(pid, 0).
         """
         import os
 
-        from pq.worker import _run_concurrent
+        from pq.worker import run_worker
 
         pid = os.fork()
         if pid == 0:
-            child_pq = PQ(db_url)
+            exit_code = 1
             try:
-                _run_concurrent(
+                child_pq = PQ(db_url)
+                run_worker(
                     child_pq,
                     concurrency=concurrency,
                     poll_interval=poll_interval,
                     max_runtime=max_runtime,
-                    priorities=None,
-                    pre_execute=None,
-                    post_execute=None,
+                    priorities=priorities,
                     retention_days=0,
-                    cleanup_interval=3600,
+                    stale_task_timeout=None,
                 )
-            except KeyboardInterrupt:
-                pass
-            child_pq.close()
-            os._exit(0)
+                child_pq.close()
+                exit_code = 0
+            finally:
+                os._exit(exit_code)
 
         return pid, os.getpid()
 
@@ -1090,36 +1096,14 @@ class TestConcurrentWorker:
         pq.enqueue(ordered_handler, n=2, priority=Priority.NORMAL)
         pq.enqueue(ordered_handler, n=3, priority=Priority.LOW)
 
-        from pq.worker import _run_concurrent
-
-        import os
-        import signal as sig
-
-        pid = os.fork()
-        if pid == 0:
-            child_pq = PQ(db_url)
-            try:
-                _run_concurrent(
-                    child_pq,
-                    concurrency=3,
-                    poll_interval=0.1,
-                    max_runtime=30,
-                    priorities={Priority.HIGH},
-                    pre_execute=None,
-                    post_execute=None,
-                    retention_days=0,
-                    cleanup_interval=3600,
-                )
-            except KeyboardInterrupt:
-                pass
-            child_pq.close()
-            os._exit(0)
+        pid, _ = self._run_concurrent_worker(
+            db_url, concurrency=3, priorities={Priority.HIGH}
+        )
 
         self._wait_for(lambda: len(pq.list_completed()) >= 1)
         # Give it time to potentially pick up more tasks (it shouldn't)
         time.sleep(0.3)
-        os.kill(pid, sig.SIGINT)
-        os.waitpid(pid, 0)
+        self._stop_worker(pid)
 
         assert list(results) == [1]  # only HIGH
         assert len(pq.list_completed()) == 1
