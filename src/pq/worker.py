@@ -1434,6 +1434,10 @@ def _orphan_statement() -> Update:
 _DEAD_WORKER_RETENTION = timedelta(hours=1)
 _PRUNE_WORKERS_INTERVAL: float = 600.0
 
+# A heartbeat that failed is tried again after this long. Waiting a whole
+# interval would let the lease run out.
+_HEARTBEAT_RETRY_SECONDS: float = 1.0
+
 
 @dataclass
 class _Heartbeat:
@@ -1456,13 +1460,29 @@ class _Heartbeat:
     def seconds_until_due(self) -> float:
         return max(self.next_beat - time.monotonic(), 0.0)
 
+    def claim_id(self) -> int | None:
+        """The worker id to claim under: this worker's, while its lease is
+        good for at least one more heartbeat interval. Otherwise None.
+
+        A task claimed under a lease that has run out, or is about to, is
+        failed as orphaned by the other workers while it runs. Without a
+        worker id only the stale reaper applies to it.
+        """
+        if self.last_beat is None:
+            return None
+        lease_left = WORKER_TIMEOUT_SECONDS - (time.monotonic() - self.last_beat)
+        return self.worker_id if lease_left > HEARTBEAT_INTERVAL_SECONDS else None
+
     def run_due(self, *, check_orphans: bool = True) -> None:
         now = time.monotonic()
         if now < self.next_beat:
             return
-        self.next_beat = now + HEARTBEAT_INTERVAL_SECONDS
         if not self._beat():
+            self.next_beat = time.monotonic() + min(
+                _HEARTBEAT_RETRY_SECONDS, HEARTBEAT_INTERVAL_SECONDS
+            )
             return
+        self.next_beat = now + HEARTBEAT_INTERVAL_SECONDS
         # Another worker is only called dead by a worker that has itself
         # got every beat through for a whole lease. After an outage of the
         # database every lease has run out, and the live workers must get
@@ -1824,8 +1844,8 @@ def _run_concurrent(
     try:
         try:
             while not _shutdown.requested:
-                # Before the claims: a worker whose lease has run out must
-                # not claim under it.
+                # Before the claims: they are made under the lease only
+                # while it is good (``claim_id``).
                 heartbeat.run_due()
 
                 # Fill empty slots with new tasks
@@ -1834,7 +1854,7 @@ def _run_concurrent(
                         pq,
                         max_runtime=max_runtime,
                         priorities=priority_values,
-                        worker_id=heartbeat.worker_id,
+                        worker_id=heartbeat.claim_id(),
                     )
                     if claim is None:
                         break

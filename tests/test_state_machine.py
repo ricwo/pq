@@ -299,6 +299,56 @@ class TestHeartbeat:
             time.sleep(0.02)
         assert _task(pq, task_id).failure_kind == FailureKind.WORKER_LOST
 
+    def test_no_claim_under_a_lease_that_may_have_run_out(
+        self, pq: PQ, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """After a failed heartbeat the worker waited a whole interval for
+        the next one and went on claiming under its id. With the lease run
+        out, the other workers failed those new tasks while they ran."""
+        monkeypatch.setattr(worker, "WORKER_TIMEOUT_SECONDS", 0.6)
+        monkeypatch.setattr(worker, "HEARTBEAT_INTERVAL_SECONDS", 0.2)
+        heartbeat = _Heartbeat(pq)
+        assert heartbeat.claim_id() is None  # no lease yet
+        heartbeat.run_due()
+        worker_id = heartbeat.worker_id
+        assert worker_id is not None and heartbeat.claim_id() == worker_id
+
+        working = worker._heartbeat_statement
+
+        def broken(*, registered: bool) -> object:
+            raise RuntimeError("database went away")
+
+        monkeypatch.setattr(worker, "_heartbeat_statement", broken)
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            heartbeat.run_due()
+            time.sleep(0.02)
+        # Less than one interval of lease left: claims carry no worker id.
+        assert heartbeat.claim_id() is None
+        pq.enqueue(noop)
+        assert _claim(pq, worker_id=heartbeat.claim_id()).worker_id is None
+
+        # The database is back: the next beat renews the lease.
+        monkeypatch.setattr(worker, "_heartbeat_statement", working)
+        deadline = time.monotonic() + 1.5
+        while heartbeat.claim_id() is None and time.monotonic() < deadline:
+            heartbeat.run_due()
+            time.sleep(0.02)
+        assert heartbeat.claim_id() == worker_id
+
+        monkeypatch.setattr(worker, "HEARTBEAT_INTERVAL_SECONDS", 30.0)
+        monkeypatch.setattr(worker, "WORKER_TIMEOUT_SECONDS", 120.0)
+        heartbeat.next_beat = 0.0
+        heartbeat.run_due()
+        assert heartbeat.seconds_until_due() > 20
+
+        # A beat that fails is tried again within a second, where the next
+        # regular one would be 30 s away.
+        monkeypatch.setattr(worker, "_heartbeat_statement", broken)
+        heartbeat.next_beat = 0.0
+        heartbeat.run_due()
+        assert heartbeat.seconds_until_due() <= 1.0
+
     def test_heartbeat_restores_a_row_that_was_deleted(self, pq: PQ) -> None:
         heartbeat = _Heartbeat(pq)
         heartbeat.run_due()

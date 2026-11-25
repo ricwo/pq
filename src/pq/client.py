@@ -450,11 +450,14 @@ class PQ:
         is stored on the row and runs after the current run ends (the worker
         or the stale reaper re-queues the row with it). A second upsert while
         the row is still RUNNING replaces the stored version, so only the
-        latest one runs. One ``client_id`` does not run twice at the same
-        time, as long as the stale reaper's timeout is longer than the
-        longest run. If the worker running the task died, the stored version
-        runs only after the stale reaper re-queues the row: with the reaper
-        disabled (``stale_task_timeout=None``) it never runs.
+        latest one runs. So one ``client_id`` does not run twice at the same
+        time. The one exception is a worker that is alive but cut off from
+        the database for longer than its heartbeat lease
+        (``pq.worker.WORKER_TIMEOUT_SECONDS``): the other workers take it
+        for dead and re-queue the row with the stored version while its run
+        goes on. If the worker running the task died, the stored version
+        runs once another worker notices the missing heartbeat, about a
+        minute later.
 
         Args:
             task: Callable function to execute.
