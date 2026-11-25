@@ -16,6 +16,8 @@
         - cancel
         - run_worker
         - run_worker_once
+        - stop_worker
+        - reap_stale_tasks
         - pending_count
         - periodic_count
         - get_task
@@ -45,6 +47,12 @@
     options:
       show_source: false
 
+## FailureKind
+
+::: pq.FailureKind
+    options:
+      show_source: false
+
 ## Models
 
 ::: pq.Task
@@ -67,6 +75,4 @@
 
 ## Exceptions
 
-::: pq.TaskTimeoutError
-    options:
-      show_source: false
+pq raises no exceptions of its own for a task that fails: the outcome is on the task (`status`, `error`, `failure_kind`). `pq.TaskTimeoutError` and the other exception classes in `pq.worker` were never raised. They are deprecated and will be removed.

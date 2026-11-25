@@ -3,6 +3,7 @@
 from collections.abc import Callable
 
 import pytest
+from alembic.config import Config
 from croniter import croniter
 from datetime import UTC, datetime, timedelta
 from sqlalchemy.exc import IntegrityError
@@ -1028,7 +1029,7 @@ class TestUpsertWhileRunning:
         directly or parked and applied when the run ends, also when the
         producer's session time zone differs from the worker's."""
         from pq.models import TaskStatus
-        from pq.worker import _finish_one_off
+        from pq.worker import _ChildResult, _finish_one_off
 
         naive_run_at = datetime(2030, 1, 2, 3, 4, 5, 678901)
         producer_url = db_url + "&options=-c%20timezone%3DAmerica/Sao_Paulo"
@@ -1043,9 +1044,7 @@ class TestUpsertWhileRunning:
             producer.upsert(dummy_handler, client_id="parked", run_at=naive_run_at)
 
         # The worker (``pq``, default session time zone) applies the version.
-        _finish_one_off(
-            pq, parked_id, started_at, "dummy_handler", TaskStatus.COMPLETED, None
-        )
+        _finish_one_off(pq, parked_id, started_at, "dummy_handler", _ChildResult(None))
 
         direct = pq.get_task(direct_id)
         parked = pq.get_task(parked_id)
@@ -1728,11 +1727,11 @@ class TestReapStaleTasksRespectsPerTaskOverride:
         # anchored with trailing punctuation so ``"=300"`` doesn't also
         # match ``"=3000"`` (defends against a future refactor that
         # changes the per-task multiplier from 2× to e.g. 3×).
-        assert "max_runtime_seconds=300," in with_msg, (
-            f"expected 'max_runtime_seconds=300,' in {with_msg!r}"
+        assert "max runtime of the run=300," in with_msg, (
+            f"expected 'max runtime of the run=300,' in {with_msg!r}"
         )
-        assert "max_runtime_seconds=NULL," in without_msg, (
-            f"expected 'max_runtime_seconds=NULL,' in {without_msg!r}"
+        assert "max runtime of the run=NULL," in without_msg, (
+            f"expected 'max runtime of the run=NULL,' in {without_msg!r}"
         )
 
         # Effective threshold reflects the reaper math: with-override
@@ -1755,24 +1754,13 @@ class TestMigrationAppliesOnPopulatedTables:
     """
 
     def test_migration_downgrade_then_upgrade_preserves_rows(
-        self, pq: PQ, db_url: str
+        self, pq: PQ, alembic_cfg: Config
     ) -> None:
         from alembic import command
-        from alembic.config import Config
-        import importlib.resources
 
         from pq.models import TaskStatus
 
-        migrations_pkg = importlib.resources.files("pq.migrations")
-        cfg = Config()
-        cfg.set_main_option("script_location", str(migrations_pkg))
-        cfg.set_main_option("sqlalchemy.url", db_url)
-
-        # The ``pq`` fixture uses ``create_tables()`` (which bypasses
-        # Alembic), so the ``pq_schema_version`` tracking table doesn't
-        # exist yet. Stamp at head so the migration history matches the
-        # schema before we exercise the downgrade → upgrade cycle.
-        command.stamp(cfg, "head")
+        cfg = alembic_cfg
 
         # The schema gets downgraded mid-test. Wrap the whole flow in
         # try/finally so a failed assertion below doesn't leave the
@@ -1856,21 +1844,15 @@ class TestRequeueMigrationAppliesOnPopulatedTables:
     cleanly."""
 
     def test_migration_downgrade_then_upgrade_preserves_rows(
-        self, pq: PQ, db_url: str
+        self, pq: PQ, alembic_cfg: Config
     ) -> None:
         from alembic import command
-        from alembic.config import Config
-        import importlib.resources
 
         from sqlalchemy import inspect, select, text
 
         from pq.models import TaskStatus
 
-        migrations_pkg = importlib.resources.files("pq.migrations")
-        cfg = Config()
-        cfg.set_main_option("script_location", str(migrations_pkg))
-        cfg.set_main_option("sqlalchemy.url", db_url)
-        command.stamp(cfg, "head")
+        cfg = alembic_cfg
 
         def task_columns() -> set[str]:
             with pq.session() as session:
@@ -1887,8 +1869,8 @@ class TestRequeueMigrationAppliesOnPopulatedTables:
                 session.execute(
                     text(
                         "INSERT INTO pq_tasks (name, payload, priority, status,"
-                        " run_at, client_id, attempts) VALUES (:name,"
-                        " '{}'::jsonb, 50, 'RUNNING', now(), :client_id, 1)"
+                        " run_at, started_at, client_id, attempts) VALUES (:name,"
+                        " '{}'::jsonb, 50, 'RUNNING', now(), now(), :client_id, 1)"
                     ),
                     {"name": "tests.dummy", "client_id": "before-requeue"},
                 )

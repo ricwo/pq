@@ -25,6 +25,7 @@ import multiprocessing.managers
 import os
 import sys
 import time
+import uuid
 import weakref
 from collections.abc import Callable, Generator
 from multiprocessing.managers import ListProxy
@@ -302,10 +303,7 @@ class TestForkHookInstanceTracking:
                 instance.close()
 
 
-PROBE_DATABASE = "pq_child_exit_probe"
-
-
-def _session_end_stats(pq: PQ) -> tuple[int, float]:
+def _session_end_stats(pq: PQ, database: str) -> tuple[int, float]:
     """``(sessions_abandoned, session_time)`` of the probe database. Postgres
     adds to both when a session ends; abandoned means the client went away
     without a terminate message."""
@@ -315,18 +313,18 @@ def _session_end_stats(pq: PQ) -> tuple[int, float]:
                 "SELECT sessions_abandoned, session_time FROM pg_stat_database"
                 " WHERE datname = :name"
             ),
-            {"name": PROBE_DATABASE},
+            {"name": database},
         ).one_or_none()
     return (0, 0.0) if row is None else (row[0], row[1])
 
 
-def _recreate_probe_database(pq: PQ, *, create: bool) -> None:
+def _recreate_probe_database(pq: PQ, database: str, *, create: bool) -> None:
     with pq._engine.connect().execution_options(
         isolation_level="AUTOCOMMIT"
     ) as connection:
-        connection.execute(text(f"DROP DATABASE IF EXISTS {PROBE_DATABASE} (FORCE)"))
+        connection.execute(text(f"DROP DATABASE IF EXISTS {database} (FORCE)"))
         if create:
-            connection.execute(text(f"CREATE DATABASE {PROBE_DATABASE}"))
+            connection.execute(text(f"CREATE DATABASE {database}"))
 
 
 class TestTaskChildClosesItsConnections:
@@ -336,15 +334,21 @@ class TestTaskChildClosesItsConnections:
     ) -> Generator[tuple[PQ, PQ], None, None]:
         """The test's PQ, and a PQ on a fresh database of its own on the same
         server. Only the task child connects to the probe database, so its
-        session counters count the child's sessions and nothing else."""
+        session counters count the child's sessions and nothing else.
+
+        The database has a name of its own: with a fixed one, two test runs
+        on one server dropped and created each other's."""
         tls = request.param == "tls"
         pq: PQ = request.getfixturevalue("tls_pq" if tls else "pq")
         url = make_url(request.getfixturevalue("tls_db_url" if tls else "db_url"))
-        _recreate_probe_database(pq, create=True)
-        probe = PQ(url.set(database=PROBE_DATABASE).render_as_string(False))
-        yield pq, probe
-        probe.close()
-        _recreate_probe_database(pq, create=False)
+        database = f"pq_child_exit_probe_{uuid.uuid4().hex[:12]}"
+        _recreate_probe_database(pq, database, create=True)
+        probe = PQ(url.set(database=database).render_as_string(False))
+        try:
+            yield pq, probe
+        finally:
+            probe.close()
+            _recreate_probe_database(pq, database, create=False)
 
     @pytest.mark.parametrize("fail", [False, True], ids=["completed", "failed"])
     def test_task_child_hangs_up_before_it_exits(
@@ -362,11 +366,13 @@ class TestTaskChildClosesItsConnections:
         assert task is not None
         assert task.status == (TaskStatus.FAILED if fail else TaskStatus.COMPLETED)
 
+        database = probe._engine.url.database
+        assert database is not None
         deadline = time.monotonic() + 5
-        abandoned, session_time = _session_end_stats(pq)
+        abandoned, session_time = _session_end_stats(pq, database)
         while session_time == 0 and time.monotonic() < deadline:
             time.sleep(0.02)
-            abandoned, session_time = _session_end_stats(pq)
+            abandoned, session_time = _session_end_stats(pq, database)
         assert session_time > 0, "the task child's session never ended"
         assert abandoned == 0, "the task child exited without closing its connection"
 
@@ -405,6 +411,7 @@ class TestRunInChildClosesPools:
 
         monkeypatch.setattr(os, "setpgrp", lambda: None)
         monkeypatch.setattr(os, "_exit", fake_exit)
+        monkeypatch.setattr(worker, "_die_with_worker", lambda _: None)
         monkeypatch.setattr(worker.signal, "signal", lambda *_: None)
         monkeypatch.setattr(worker.signal, "alarm", lambda _: 0)
         monkeypatch.setattr(
@@ -422,6 +429,7 @@ class TestRunInChildClosesPools:
                     Task(name="t", payload={}),
                     None,
                     None,
+                    os.getpid(),
                 )
         finally:
             os.close(read_fd)

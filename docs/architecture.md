@@ -59,7 +59,11 @@ pq.schedule(cleanup, run_every=timedelta(hours=1))
 | `status` | pending → running → completed/failed |
 | `run_at` | Scheduled execution time |
 | `error` | Error message if failed |
+| `failure_kind` | Why it failed: `error`, `timeout`, `oom`, `killed`, `shutdown`, `worker_lost` or `stale` |
 | `requeue` | JSONB with the next version, stored by an `upsert()` that arrived while the task was running. Applied when the run ends |
+| `worker_id` | The `pq_workers` row of the worker running it. Set by the claim, cleared when the run ends |
+| `worker_claimed_at` | The `started_at` of the claim that wrote `worker_id`. The orphan check ignores a `worker_id` that an earlier claim left on the row |
+| `claimed_max_runtime_seconds` | The max runtime of the run in progress: the task's own, or the default of the worker that claimed it |
 
 **`pq_periodic`** - Recurring schedules:
 
@@ -73,6 +77,14 @@ pq.schedule(cleanup, run_every=timedelta(hours=1))
 | `cron` | Cron expression (e.g., `0 9 * * 1`) |
 | `active` | Whether the task is executed (default `true`) |
 | `next_run` | Next scheduled execution |
+
+**`pq_workers`** - Running workers:
+
+| Column | Purpose |
+|--------|---------|
+| `hostname`, `pid` | Where the worker runs |
+| `started_at` | When it started |
+| `expires_at` | End of its heartbeat lease. The worker moves it 60 s ahead every 15 s |
 
 ## Fork Isolation
 
@@ -91,6 +103,7 @@ flowchart LR
         setup["Set timeout"]
         pre["pre_execute()"]
         exec["Execute handler"]
+        report["Report outcome"]
         post["post_execute()"]
         exit["exit()"]
     end
@@ -99,22 +112,25 @@ flowchart LR
     fork --> setup
     setup --> pre
     pre --> exec
-    exec --> post
+    exec --> report
+    report --> post
     post --> exit
+    report -.->|"pipe"| wait
     exit -.->|"exit code"| wait
     wait --> update
     update --> poll
 ```
 
-The parent monitors the child via `wait4()` and detects:
+When the handler returns or raises, the child writes the outcome to a pipe, before `post_execute` runs. That outcome is the task's result, however the process ends afterwards. If the child wrote nothing, the handler did not get to its end, and the way the process ended decides:
 
-| Exit Condition | Detection | Result |
-|----------------|-----------|--------|
-| Success | Exit code 0 | `COMPLETED` |
-| Exception | Exit code 1 + pipe message | `FAILED` with error |
-| Timeout | Exit code 124 (the child stopped itself), or the worker's SIGKILL 10 s after `max_runtime` | `FAILED` with timeout |
-| OOM | SIGKILL (signal 9) | `FAILED` with OOM |
-| Crash | Other signals | `FAILED` with signal |
+| What the worker sees | Result | `failure_kind` |
+|----------------------|--------|----------------|
+| Pipe: handler returned | `COMPLETED` | |
+| Pipe: error report | `FAILED` with the traceback | `error` |
+| Exit code 124 (the child stopped itself), or the worker's SIGKILL 10 s after `max_runtime` | `FAILED` with timeout | `timeout` |
+| The worker's SIGKILL at the end of its drain | `FAILED` with shutdown error | `shutdown` |
+| SIGKILL from outside (signal 9) | `FAILED` with OOM | `oom` |
+| Other signals | `FAILED` with signal | `killed` |
 
 **Benefits:**
 
@@ -170,7 +186,9 @@ flowchart LR
 
 ```sql
 UPDATE pq_tasks
-SET status = 'RUNNING', started_at = now(), attempts = attempts + 1
+SET status = 'RUNNING', started_at = now(), attempts = attempts + 1,
+    worker_id = :worker_id, worker_claimed_at = now(),
+    claimed_max_runtime_seconds = coalesce(max_runtime_seconds, :worker_max_runtime)
 WHERE id = (
     SELECT id FROM pq_tasks
     WHERE status = 'PENDING' AND run_at <= now()
@@ -188,7 +206,7 @@ RETURNING *;
 
 One-off tasks and periodic schedules form one queue: priority first, then the time they came due. Before the claim above, the worker reads the first due schedule. If there is one, the task is claimed only if it goes before it; otherwise the schedule is claimed, in a transaction that locks it and advances it to its next run.
 
-Claiming a task, recording its result and enqueuing are one statement each, sent in autocommit: no `BEGIN` and `COMMIT` round trips. A poll that finds nothing costs three statements (connection check, read of the schedules, claim), a processed task five, an enqueue two.
+Claiming a task, recording its result and enqueuing are one statement each, sent in autocommit: no `BEGIN` and `COMMIT` round trips. A poll that finds nothing costs three statements (connection check, read of the schedules, claim), a processed task five, an enqueue two. The heartbeat adds a connection check and up to two statements per worker every 15 seconds.
 
 ## Priority System
 
@@ -240,16 +258,38 @@ flowchart TD
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PENDING: enqueue()
-    PENDING --> RUNNING: worker claims
-    RUNNING --> COMPLETED: success
-    RUNNING --> FAILED: error/timeout/OOM
-    RUNNING --> PENDING: run ends with a parked upsert
+    state "RUNNING" as R
+    state "RUNNING, new version parked" as RP
+    [*] --> PENDING: enqueue() or upsert()
+    PENDING --> PENDING: upsert() overwrites
+    PENDING --> R: worker claims
+    R --> RP: upsert() parks a version
+    RP --> RP: upsert() replaces it
+    R --> COMPLETED: handler returned
+    R --> FAILED: run failed, worker lost, or stale
+    RP --> PENDING: run ends, worker lost, or stale
+    COMPLETED --> PENDING: upsert()
+    FAILED --> PENDING: upsert()
+    FAILED --> COMPLETED: late result after WORKER_LOST
+    PENDING --> [*]: cancel()
+    COMPLETED --> [*]: cancel() or cleanup
+    FAILED --> [*]: cancel() or cleanup
 ```
 
-`upsert()` on a RUNNING task does not change the run in progress. It stores the new version in `requeue`. When the run ends (success, failure, timeout, shutdown, or stale reap), the row goes back to PENDING with that version instead of COMPLETED or FAILED. So one `client_id` does not run twice at the same time, as long as `stale_task_timeout` is longer than the longest run.
+Each transition is one SQL statement whose `WHERE` clause is its guard. `cancel()` does not match a RUNNING row.
 
-The worker records the end of a run only if the row is still RUNNING with the `started_at` of that run's claim. A run that ends after its row was reaped (and maybe claimed again) leaves the row alone.
+`upsert()` on a RUNNING task does not change the run in progress. It stores the new version in `requeue`. When the run ends (success, failure, timeout, shutdown, or a reap), the row goes back to PENDING with that version instead of COMPLETED or FAILED. So one `client_id` does not run twice at the same time.
+
+The worker records the end of a run only if the row still belongs to that run: it is RUNNING with the `started_at` of the run's claim. A run that ends after its row was reaped and claimed again leaves the row alone.
+
+### Rows left RUNNING
+
+A row can stay RUNNING with no run behind it. Two checks find such rows, and both fail the row or, if a version is parked, re-queue it:
+
+- **Worker lost.** Each worker holds a lease in `pq_workers` and renews it every 15 s. A RUNNING row whose `worker_id` (written by its current claim) points at a lease that ran out (60 s without a renewal), or at no row, is orphaned. Every worker runs this check after each of its own heartbeats, once it has itself renewed on time for a whole lease. That wait matters after a database outage: every lease has run out then, and the live workers have to renew before anyone judges them. On Linux a task's process is killed by the kernel when its worker dies (`PR_SET_PDEATHSIG`), so an orphaned row has no process behind it.
+- **Stale.** A row that has been RUNNING for longer than `stale_task_timeout` (default 1 hour) and twice its `claimed_max_runtime_seconds`. This covers rows without a worker id (`run_worker_once`) and runs whose result could not be written.
+
+A worker that was cut off from the database and comes back may find its tasks failed as `worker_lost` while they ran. When such a run ends, its result replaces the verdict, unless the row was re-queued in the meantime.
 
 ## File Structure
 
@@ -258,7 +298,7 @@ src/pq/
 ├── __init__.py      # Public API exports
 ├── client.py        # PQ class - main interface
 ├── worker.py        # Worker loop and fork execution
-├── models.py        # SQLAlchemy models (Task, Periodic)
+├── models.py        # SQLAlchemy models (Task, Periodic, Worker)
 ├── priority.py      # Priority enum
 ├── serialization.py # JSON/Pydantic/dill serialization
 ├── registry.py      # Function path resolution
