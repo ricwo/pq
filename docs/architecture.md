@@ -62,6 +62,7 @@ pq.schedule(cleanup, run_every=timedelta(hours=1))
 | `failure_kind` | Why it failed: `error`, `timeout`, `oom`, `killed`, `shutdown`, `worker_lost` or `stale` |
 | `requeue` | JSONB with the next version, stored by an `upsert()` that arrived while the task was running. Applied when the run ends |
 | `worker_id` | The `pq_workers` row of the worker running it. Set by the claim, cleared when the run ends |
+| `worker_claimed_at` | The `started_at` of the claim that wrote `worker_id`. The orphan check ignores a `worker_id` that an earlier claim left on the row |
 | `claimed_max_runtime_seconds` | The max runtime of the run in progress: the task's own, or the default of the worker that claimed it |
 
 **`pq_periodic`** - Recurring schedules:
@@ -186,7 +187,7 @@ flowchart LR
 ```sql
 UPDATE pq_tasks
 SET status = 'RUNNING', started_at = now(), attempts = attempts + 1,
-    worker_id = :worker_id,
+    worker_id = :worker_id, worker_claimed_at = now(),
     claimed_max_runtime_seconds = coalesce(max_runtime_seconds, :worker_max_runtime)
 WHERE id = (
     SELECT id FROM pq_tasks
@@ -285,7 +286,7 @@ The worker records the end of a run only if the row still belongs to that run: i
 
 A row can stay RUNNING with no run behind it. Two checks find such rows, and both fail the row or, if a version is parked, re-queue it:
 
-- **Worker lost.** Each worker holds a lease in `pq_workers` and renews it every 15 s. A RUNNING row whose `worker_id` points at a lease that ran out (60 s without a renewal), or at no row, is orphaned. Every worker runs this check after each of its own heartbeats, once it has itself renewed on time for a whole lease. That wait matters after a database outage: every lease has run out then, and the live workers have to renew before anyone judges them. On Linux a task's process is killed by the kernel when its worker dies (`PR_SET_PDEATHSIG`), so an orphaned row has no process behind it.
+- **Worker lost.** Each worker holds a lease in `pq_workers` and renews it every 15 s. A RUNNING row whose `worker_id` (written by its current claim) points at a lease that ran out (60 s without a renewal), or at no row, is orphaned. Every worker runs this check after each of its own heartbeats, once it has itself renewed on time for a whole lease. That wait matters after a database outage: every lease has run out then, and the live workers have to renew before anyone judges them. On Linux a task's process is killed by the kernel when its worker dies (`PR_SET_PDEATHSIG`), so an orphaned row has no process behind it.
 - **Stale.** A row that has been RUNNING for longer than `stale_task_timeout` (default 1 hour) and twice its `claimed_max_runtime_seconds`. This covers rows without a worker id (`run_worker_once`) and runs whose result could not be written.
 
 A worker that was cut off from the database and comes back may find its tasks failed as `worker_lost` while they ran. When such a run ends, its result replaces the verdict, unless the row was re-queued in the meantime.

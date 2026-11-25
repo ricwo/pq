@@ -161,6 +161,14 @@ class Task(Base):
     # (NULL for ``run_worker_once``, which has none). No foreign key: a
     # worker that is gone is exactly what the orphan check looks for.
     worker_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # The ``started_at`` of the claim that wrote ``worker_id``. The orphan
+    # check only trusts a ``worker_id`` whose claim is the row's current
+    # one. A worker of a release before these columns claims without
+    # writing them, and would otherwise run under the id a row was left
+    # with.
+    worker_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # The max runtime this run has: the task's own ``max_runtime_seconds``,
     # or the default of the worker that claimed it. The stale reaper of every
     # worker goes by this value.
@@ -214,6 +222,7 @@ def run_ended_values() -> dict[str, ColumnElement[Any]]:
     """
     return {
         "worker_id": cast(null(), Task.worker_id.type),
+        "worker_claimed_at": cast(null(), Task.worker_claimed_at.type),
         "claimed_max_runtime_seconds": cast(
             null(), Task.claimed_max_runtime_seconds.type
         ),

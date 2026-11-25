@@ -9,16 +9,19 @@ Create Date: 2026-11-25 12:00:00 Z
 tasks that carry the worker's id are orphaned and are failed or re-queued
 without waiting for the stale window.
 
-Three columns on ``pq_tasks``:
+Four columns on ``pq_tasks``:
 
 - ``worker_id``: the worker running the task, written by the claim.
+- ``worker_claimed_at``: the ``started_at`` of the claim that wrote
+  ``worker_id``. A worker of the previous release claims without writing
+  either, so a ``worker_id`` it finds on the row is not taken for its own.
 - ``claimed_max_runtime_seconds``: the max runtime this run has, written by
   the claim. The stale reaper of any worker goes by it, where it used to go
   by its own worker's default.
 - ``failure_kind``: why a FAILED task failed (``pq.FailureKind``), next to
   the text in ``error``.
 
-All three are nullable without a default, so adding them is a catalog-only
+All four are nullable without a default, so adding them is a catalog-only
 change. Rows from before the migration have NULL: no worker to check, the
 reaper's own window, cause unknown.
 
@@ -73,6 +76,7 @@ _CHECKS: tuple[tuple[str, str, str], ...] = (
 _TASK_COLUMNS: tuple[tuple[str, str], ...] = (
     ("failure_kind", "VARCHAR(16)"),
     ("worker_id", "BIGINT"),
+    ("worker_claimed_at", "TIMESTAMP WITH TIME ZONE"),
     ("claimed_max_runtime_seconds", "DOUBLE PRECISION"),
 )
 

@@ -39,7 +39,9 @@ Reading the tables is safe. If your application also updates `pq_tasks` with its
 
 The migration adds the constraints as `NOT VALID`: they apply to rows that are inserted or updated from then on, and the existing rows are not read. To have the old rows checked as well, run `ALTER TABLE pq_tasks VALIDATE CONSTRAINT <name>` for each.
 
-Three columns describe the run in progress and are cleared when it ends: `worker_id`, `claimed_max_runtime_seconds` and, for the next version of the task, `requeue`. `failure_kind` is set on `FAILED` rows only. A statement of your own that moves a row to another status should clear them the way pq does.
+These columns describe the run in progress and are cleared when it ends: `worker_id`, `worker_claimed_at`, `claimed_max_runtime_seconds` and, for the next version of the task, `requeue`. `failure_kind` is set on `FAILED` rows only. A statement of your own that moves a row to another status should clear them the way pq does.
+
+Workers and clients of the release before these columns do not write or clear them. While some are still running, a row they finish or re-queue keeps the `failure_kind` it had. The orphan check is safe with them: it only acts on a `worker_id` written by the row's current claim.
 
 ## Alembic Integration
 

@@ -928,6 +928,7 @@ def _claim_task_statement(
         attempts=tasks.c.attempts + 1,
         failure_kind=None,
         worker_id=bindparam("worker_id", type_=tasks.c.worker_id.type),
+        worker_claimed_at=func.now(),  # the same instant as ``started_at``
         claimed_max_runtime_seconds=func.coalesce(
             tasks.c.max_runtime_seconds,
             bindparam(
@@ -1422,6 +1423,9 @@ def _orphan_statement() -> Update:
         .where(
             tasks.c.status == TaskStatus.RUNNING,
             tasks.c.worker_id.is_not(None),
+            # The id is from the claim of this run, not left on the row by
+            # an earlier one (see ``Task.worker_claimed_at``).
+            tasks.c.worker_claimed_at == tasks.c.started_at,
             ~alive,
         )
         .values(end_run_values(closed))

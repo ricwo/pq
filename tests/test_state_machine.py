@@ -249,6 +249,37 @@ class TestHeartbeat:
         for name in ("alive", "none"):
             assert _task(pq, ids[name]).status == TaskStatus.RUNNING, name
 
+    def test_worker_id_left_by_an_earlier_claim_is_ignored(self, pq: PQ) -> None:
+        """A worker of the release before the heartbeat claims without
+        writing ``worker_id``, and nothing in that release clears it. Its
+        run must not be judged by the id a row was left with."""
+        dead = _add_worker(pq, lease=timedelta(seconds=-1))
+        task_id = pq.enqueue(noop)
+        _claim(pq, worker_id=dead)
+        with pq.session() as session:
+            # The old release takes the row back to PENDING and claims it:
+            # neither statement knows the new columns.
+            session.execute(
+                text(
+                    "UPDATE pq_tasks SET status = 'PENDING', started_at = NULL"
+                    " WHERE id = :id"
+                ),
+                {"id": task_id},
+            )
+            session.execute(
+                text(
+                    "UPDATE pq_tasks SET status = 'RUNNING',"
+                    " started_at = now() + interval '1 second' WHERE id = :id"
+                ),
+                {"id": task_id},
+            )
+
+        _Heartbeat(pq)._reap_orphans()
+
+        task = _task(pq, task_id)
+        assert task.worker_id == dead
+        assert task.status == TaskStatus.RUNNING
+
     def test_orphan_with_a_parked_version_is_requeued(self, pq: PQ) -> None:
         dead = _add_worker(pq, lease=timedelta(seconds=-1))
         task_id = pq.upsert(noop, client_id="job")
@@ -784,7 +815,12 @@ class TestMigration:
                     },
                 )
 
-        new_columns = {"failure_kind", "worker_id", "claimed_max_runtime_seconds"}
+        new_columns = {
+            "failure_kind",
+            "worker_id",
+            "worker_claimed_at",
+            "claimed_max_runtime_seconds",
+        }
         try:
             command.downgrade(cfg, "e5f6a7b8c9d0")
             tables, columns, checks = schema()
