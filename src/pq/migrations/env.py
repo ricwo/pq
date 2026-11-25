@@ -1,9 +1,10 @@
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import Connection, engine_from_config, pool, text
 
 from alembic import context
 
+from pq.migrations import MIGRATION_LOCK_KEY
 from pq.models import Base
 
 # this is the Alembic Config object, which provides
@@ -20,6 +21,55 @@ target_metadata = Base.metadata
 
 # Custom version table name to match pq_ naming convention
 VERSION_TABLE = "pq_schema_version"
+
+# Locked before a migration, in this order. A worker statement that reads two
+# of them takes them in the same order.
+_LOCKED_TABLES = ("pq_periodic", "pq_tasks", "pq_workers")
+
+
+def _will_migrate() -> bool:
+    """Whether this run changes the schema or its version.
+
+    False for a command that only reads (``current``, ``check``) and for an
+    upgrade of a database that is already at its target, which is what a
+    worker start is on every start but the first after a release.
+    """
+    try:
+        target = context.get_revision_argument()
+    except KeyError:
+        return False
+    if target is None:
+        wanted: set[str] = set()
+    elif isinstance(target, str):
+        wanted = {target}
+    else:
+        wanted = set(target)
+    return set(context.get_context().get_current_heads()) != wanted
+
+
+def _lock_for_migration(connection: Connection) -> None:
+    """Take every lock the migration needs before it changes anything.
+
+    A migration that locks ``pq_tasks`` step by step (``SHARE`` for an index,
+    then ``ACCESS EXCLUSIVE`` for a column) deadlocks with a transaction that
+    read the table before the first step and writes to it before the second,
+    and with another process running the same migration.
+
+    The advisory lock lets one process migrate at a time. The others wait
+    here, then read the version and find nothing to apply. The table locks
+    are the strongest a migration takes, requested while it holds none on
+    those tables, so it waits for running transactions and they do not wait
+    for it. All locks end with the migration's transaction.
+    """
+    connection.execute(
+        text("SELECT pg_advisory_xact_lock(:key)"), {"key": MIGRATION_LOCK_KEY}
+    )
+    for table in _LOCKED_TABLES:
+        exists = connection.execute(
+            text("SELECT to_regclass(:name) IS NOT NULL"), {"name": table}
+        ).scalar_one()
+        if exists:
+            connection.execute(text(f"LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"))
 
 
 def run_migrations_offline() -> None:
@@ -76,6 +126,8 @@ def run_migrations_online() -> None:
         )
 
         with context.begin_transaction():
+            if _will_migrate():
+                _lock_for_migration(connection)
             context.run_migrations()
 
 
