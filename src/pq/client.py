@@ -6,6 +6,7 @@ import os
 import weakref
 from functools import lru_cache
 from collections.abc import Callable, Iterator, Sequence, Set
+from typing import TYPE_CHECKING
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -21,10 +22,21 @@ from sqlalchemy.dialects.postgresql import Insert, insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import InstrumentedAttribute, Session, sessionmaker
 
-from pq.models import Base, Periodic, Task, TaskStatus, requeue_values
+from pq.models import (
+    Base,
+    FailureKind,
+    Periodic,
+    Task,
+    TaskStatus,
+    requeue_values,
+    run_ended_values,
+)
 from pq.priority import Priority
 from pq.registry import get_function_path
 from pq.serialization import serialize
+
+if TYPE_CHECKING:
+    from pq.worker import PostExecuteHook, PreExecuteHook
 
 
 def _validate_max_runtime(max_runtime_seconds: float | None) -> None:
@@ -241,6 +253,11 @@ def _upsert_statement() -> Insert:
             "started_at": reset_unless_running(Task.started_at, None),
             "completed_at": reset_unless_running(Task.completed_at, None),
             "error": reset_unless_running(Task.error, None),
+            "failure_kind": reset_unless_running(Task.failure_kind, None),
+            "worker_id": reset_unless_running(Task.worker_id, None),
+            "claimed_max_runtime_seconds": reset_unless_running(
+                Task.claimed_max_runtime_seconds, None
+            ),
             "requeue": sa.case((running, requeue), else_=sa.null()),
         },
     )
@@ -665,16 +682,25 @@ class PQ:
             return session.execute(stmt).scalar_one()
 
     def cancel(self, task_id: int) -> bool:
-        """Cancel a one-off task by ID.
+        """Cancel a one-off task by ID: delete it, unless it is running.
+
+        A RUNNING task is left alone and ``False`` is returned. pq does not
+        stop a run in progress, and deleting its row would only hide it: the
+        run would go on, and a task enqueued again under the same
+        ``client_id`` would run next to it. A version that an ``upsert()``
+        parked on the running row stays parked as well.
 
         Args:
             task_id: Task ID.
 
         Returns:
-            True if task was found and deleted, False otherwise.
+            True if the task was found and deleted. False if there is no
+            such task, or it is running.
         """
         with self._autocommit() as session:
-            stmt = delete(Task).where(Task.id == task_id)
+            stmt = delete(Task).where(
+                Task.id == task_id, Task.status != TaskStatus.RUNNING
+            )
             return session.connection().execute(stmt).rowcount > 0
 
     def unschedule(self, task: Callable[..., Any] | str, *, key: str = "") -> bool:
@@ -832,42 +858,40 @@ class PQ:
     def reap_stale_tasks(self, threshold: timedelta) -> int:
         """Mark stale RUNNING tasks as FAILED, or re-queue them.
 
-        When a worker dies mid-execution (e.g. pod restart, OOM on the worker
-        process), in-flight tasks stay RUNNING forever because no parent
-        process remains to update their status. This method detects those
-        orphaned rows and transitions them to FAILED.
+        A RUNNING row can outlive its run: the worker died without a
+        heartbeat to miss (``run_worker_once`` has none), or the run ended
+        and its result could not be written. This method finds those rows
+        by their age and fails them (``FailureKind.STALE``).
 
         A stale row that holds a version parked by ``upsert()`` (see
         ``Task.requeue``) is re-queued as PENDING with that version instead
         of being failed, so the parked version is not lost.
 
-        Tasks enqueued with a per-task ``max_runtime_seconds`` override get a
-        proportionally larger reaper window: the effective threshold for
-        a row is ``max(threshold, max_runtime_seconds * 2)``. This avoids
-        reaping a legitimately long-running task whose declared budget
-        exceeds the global default. NULL ``max_runtime_seconds`` (the
-        common case) falls back to the supplied ``threshold`` unchanged.
+        A row is stale when it has been RUNNING for longer than
+        ``max(threshold, 2 * max runtime of its run)``. The max runtime of
+        the run is what its claim wrote to the row: the task's own
+        ``max_runtime_seconds``, or the default of the worker that claimed
+        it. So a reaper with a short window does not fail the runs of a
+        worker with a longer max runtime. A row claimed by a version of pq
+        that did not record this falls back to the task's own
+        ``max_runtime_seconds``, and then to ``threshold``.
 
         Args:
-            threshold: Default per-task stale window for tasks that don't
-                have a ``max_runtime_seconds`` override (or whose override
-                is smaller than this default). A task is stale when
-                ``started_at + effective_threshold < now()``. Should be
-                at least 2x the worker's own ``max_runtime_seconds``, e.g.
-                ``timedelta(seconds=max_runtime_seconds * 2)``.
+            threshold: The shortest stale window. A task is stale when
+                ``started_at + effective_threshold < now()``.
 
         Returns:
             Number of tasks reaped (failed plus re-queued).
         """
         threshold_seconds = threshold.total_seconds()
-        # Per-row effective stale window: the larger of the supplied
-        # default and 2x the row's per-task override (NULL → just the
-        # default). Computed in SQL with ``GREATEST`` + ``COALESCE``
-        # so the reaper stays a single round-trip even when the row
-        # set is heterogeneous in declared budget.
+        run_max_runtime = sa.func.coalesce(
+            Task.claimed_max_runtime_seconds, Task.max_runtime_seconds
+        )
+        # Per-row effective stale window, computed in SQL so that rows with
+        # different max runtimes are handled by one statement.
         effective_threshold_seconds = sa.func.greatest(
             threshold_seconds,
-            sa.func.coalesce(Task.max_runtime_seconds * 2, threshold_seconds),
+            sa.func.coalesce(run_max_runtime * 2, threshold_seconds),
         )
         stale_cutoff = sa.func.now() - sa.func.make_interval(
             sa.literal(0),  # years
@@ -878,20 +902,15 @@ class PQ:
             sa.literal(0),  # mins
             effective_threshold_seconds,  # secs
         )
-        # Per-row ``error`` message includes the values that actually
-        # decided this row's fate: the row's own
-        # ``max_runtime_seconds`` (or ``NULL`` if unset) and the
-        # effective threshold the reaper applied. This avoids the
-        # operator needing a separate query to figure out "why did MY
-        # long-budget task get reaped?" — the answer is in the row.
-        # Built with Postgres ``format()`` so the message is computed
-        # per row in the same UPDATE round-trip.
+        # The error names the values that decided this row's fate, so that
+        # "why was my long task reaped?" is answered by the row itself.
+        # Built with Postgres ``format()``, per row, in the same statement.
         per_row_error = sa.func.format(
             "Reaped: task still RUNNING past its stale window "
-            "(default threshold=%s s, per-task max_runtime_seconds=%s, "
-            "effective threshold=%s s). Worker likely died.",
+            "(default threshold=%s s, max runtime of the run=%s,"
+            " effective threshold=%s s). Worker likely died.",
             threshold_seconds,
-            sa.func.coalesce(sa.cast(Task.max_runtime_seconds, sa.String), "NULL"),
+            sa.func.coalesce(sa.cast(run_max_runtime, sa.String), "NULL"),
             effective_threshold_seconds,
         )
         stale = (Task.status == TaskStatus.RUNNING, Task.started_at < stale_cutoff)
@@ -902,6 +921,8 @@ class PQ:
                 status=TaskStatus.FAILED,
                 completed_at=func.now(),
                 error=per_row_error,
+                failure_kind=FailureKind.STALE,
+                **run_ended_values(),
             )
             .returning(Task.id, Task.name, Task.started_at, Task.max_runtime_seconds)
         )
@@ -938,9 +959,15 @@ class PQ:
         poll_interval: float = 1.0,
         max_runtime: float = 30 * 60,
         priorities: Set[Priority] | None = None,
+        retention_days: int = 7,
+        cleanup_interval: float = 3600,
+        stale_task_timeout: timedelta | None = timedelta(hours=1),
         drain_timeout: float = 20.0,
+        pre_execute: "PreExecuteHook | None" = None,
+        post_execute: "PostExecuteHook | None" = None,
     ) -> None:
-        """Run the worker loop (blocking).
+        """Run the worker loop (blocking). Same as ``pq.worker.run_worker``,
+        which documents every argument and the shutdown in full.
 
         Each task executes in a forked child process for memory isolation.
 
@@ -958,10 +985,18 @@ class PQ:
             max_runtime: Maximum execution time per task in seconds. Default: 30 min.
             priorities: If set, only process tasks with these priority levels.
                 Use this to dedicate workers to specific priority tiers.
+            retention_days: Days to keep completed/failed tasks. Default: 7.
+                ``0`` disables the cleanup.
+            cleanup_interval: Seconds between cleanup runs. Default: 1 hour.
+            stale_task_timeout: Fail RUNNING tasks older than this (see
+                ``reap_stale_tasks``). Default: 1 hour. ``None`` disables it.
             drain_timeout: Seconds to wait for in-flight tasks on
                 SIGTERM/SIGINT. Default: 20. Set below the orchestrator's
                 termination grace period. ``0`` skips the wait: in-flight
                 tasks are killed as soon as the shutdown is noticed.
+            pre_execute: Called in the forked child before the task runs.
+            post_execute: Called in the forked child after the task ran,
+                with the exception it raised or ``None``.
         """
         from pq.worker import run_worker
 
@@ -971,26 +1006,57 @@ class PQ:
             poll_interval=poll_interval,
             max_runtime=max_runtime,
             priorities=priorities,
+            retention_days=retention_days,
+            cleanup_interval=cleanup_interval,
+            stale_task_timeout=stale_task_timeout,
             drain_timeout=drain_timeout,
+            pre_execute=pre_execute,
+            post_execute=post_execute,
         )
+
+    def stop_worker(self) -> None:
+        """Ask the worker running in this process to drain and stop, the way
+        SIGTERM does. Safe to call from any thread, and the only way to stop
+        a worker that runs outside the main thread. See
+        ``pq.worker.stop_worker``.
+        """
+        from pq.worker import stop_worker
+
+        stop_worker()
 
     def run_worker_once(
         self,
         *,
         max_runtime: float = 30 * 60,
         priorities: Set[Priority] | None = None,
+        pre_execute: "PreExecuteHook | None" = None,
+        post_execute: "PostExecuteHook | None" = None,
     ) -> bool:
-        """Process a single task if available.
+        """Process a single task if available. Same as
+        ``pq.worker.run_worker_once``.
 
         Each task executes in a forked child process for memory isolation.
+
+        This is one claim and one run, without what ``run_worker`` does
+        around them: no heartbeat, no cleanup, no stale reaper and no signal
+        handling. A program that loops over it calls ``reap_stale_tasks``
+        itself.
 
         Args:
             max_runtime: Maximum execution time per task in seconds. Default: 30 min.
             priorities: If set, only process tasks with these priority levels.
+            pre_execute: Called in the forked child before the task runs.
+            post_execute: Called in the forked child after the task ran.
 
         Returns:
             True if a task was processed, False if queue was empty.
         """
         from pq.worker import run_worker_once
 
-        return run_worker_once(self, max_runtime=max_runtime, priorities=priorities)
+        return run_worker_once(
+            self,
+            max_runtime=max_runtime,
+            priorities=priorities,
+            pre_execute=pre_execute,
+            post_execute=post_execute,
+        )

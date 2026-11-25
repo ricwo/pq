@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from pq.client import PQ
-from pq.models import Periodic, TaskStatus
+from pq.models import FailureKind, Periodic, TaskStatus
 from pq.priority import Priority
 
 if TYPE_CHECKING:
@@ -2095,13 +2095,19 @@ class TestFinishOneOff:
     ) -> list[str]:
         from loguru import logger
 
-        from pq.worker import _finish_one_off
+        from pq.worker import _ChildResult, _finish_one_off
+
+        failure = None if status == TaskStatus.COMPLETED else FailureKind.ERROR
 
         messages: list[str] = []
         sink = logger.add(messages.append, level="WARNING", format="{message}")
         try:
             _finish_one_off(
-                pq, task_id, started_at, "capture_handler", status, error_msg
+                pq,
+                task_id,
+                started_at,
+                "capture_handler",
+                _ChildResult(failure, error_msg),
             )
         finally:
             logger.remove(sink)
@@ -2112,13 +2118,17 @@ class TestFinishOneOff:
         from sqlalchemy import text
 
         from pq.models import TaskStatus
-        from pq.worker import _finish_one_off
+        from pq.worker import _ChildResult, _finish_one_off
 
         task_id, started_at = self._running_task(pq)
         pq.upsert(capture_handler, value=2, client_id="finish")
 
         _finish_one_off(
-            pq, task_id, started_at, "capture_handler", TaskStatus.FAILED, "boom"
+            pq,
+            task_id,
+            started_at,
+            "capture_handler",
+            _ChildResult(FailureKind.ERROR, "boom"),
         )
 
         task = pq.get_task(task_id)
@@ -2139,12 +2149,16 @@ class TestFinishOneOff:
 
     def test_records_result_without_parked_version(self, pq: PQ) -> None:
         from pq.models import TaskStatus
-        from pq.worker import _finish_one_off
+        from pq.worker import _ChildResult, _finish_one_off
 
         task_id, started_at = self._running_task(pq)
 
         _finish_one_off(
-            pq, task_id, started_at, "capture_handler", TaskStatus.FAILED, "boom"
+            pq,
+            task_id,
+            started_at,
+            "capture_handler",
+            _ChildResult(FailureKind.ERROR, "boom"),
         )
 
         task = pq.get_task(task_id)
@@ -2176,7 +2190,7 @@ class TestFinishOneOff:
         from datetime import timedelta
 
         from pq.models import TaskStatus
-        from pq.worker import _finish_one_off
+        from pq.worker import _ChildResult, _finish_one_off
 
         # Run 0 is alive but slow, with a parked version (value=2).
         task_id = pq.upsert(capture_handler, value=1, client_id="finish")
@@ -2209,7 +2223,7 @@ class TestFinishOneOff:
 
         # Run 1 ends normally and re-queues the row with its parked version.
         _finish_one_off(
-            pq, task_id, run_1_started_at, "capture_handler", TaskStatus.COMPLETED, None
+            pq, task_id, run_1_started_at, "capture_handler", _ChildResult(None)
         )
         task = pq.get_task(task_id)
         assert task is not None

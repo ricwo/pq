@@ -405,6 +405,7 @@ class TestRunInChildClosesPools:
 
         monkeypatch.setattr(os, "setpgrp", lambda: None)
         monkeypatch.setattr(os, "_exit", fake_exit)
+        monkeypatch.setattr(worker, "_die_with_worker", lambda _: None)
         monkeypatch.setattr(worker.signal, "signal", lambda *_: None)
         monkeypatch.setattr(worker.signal, "alarm", lambda _: 0)
         monkeypatch.setattr(
@@ -422,6 +423,7 @@ class TestRunInChildClosesPools:
                     Task(name="t", payload={}),
                     None,
                     None,
+                    os.getpid(),
                 )
         finally:
             os.close(read_fd)

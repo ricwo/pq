@@ -1028,7 +1028,7 @@ class TestUpsertWhileRunning:
         directly or parked and applied when the run ends, also when the
         producer's session time zone differs from the worker's."""
         from pq.models import TaskStatus
-        from pq.worker import _finish_one_off
+        from pq.worker import _ChildResult, _finish_one_off
 
         naive_run_at = datetime(2030, 1, 2, 3, 4, 5, 678901)
         producer_url = db_url + "&options=-c%20timezone%3DAmerica/Sao_Paulo"
@@ -1043,9 +1043,7 @@ class TestUpsertWhileRunning:
             producer.upsert(dummy_handler, client_id="parked", run_at=naive_run_at)
 
         # The worker (``pq``, default session time zone) applies the version.
-        _finish_one_off(
-            pq, parked_id, started_at, "dummy_handler", TaskStatus.COMPLETED, None
-        )
+        _finish_one_off(pq, parked_id, started_at, "dummy_handler", _ChildResult(None))
 
         direct = pq.get_task(direct_id)
         parked = pq.get_task(parked_id)
@@ -1728,11 +1726,11 @@ class TestReapStaleTasksRespectsPerTaskOverride:
         # anchored with trailing punctuation so ``"=300"`` doesn't also
         # match ``"=3000"`` (defends against a future refactor that
         # changes the per-task multiplier from 2× to e.g. 3×).
-        assert "max_runtime_seconds=300," in with_msg, (
-            f"expected 'max_runtime_seconds=300,' in {with_msg!r}"
+        assert "max runtime of the run=300," in with_msg, (
+            f"expected 'max runtime of the run=300,' in {with_msg!r}"
         )
-        assert "max_runtime_seconds=NULL," in without_msg, (
-            f"expected 'max_runtime_seconds=NULL,' in {without_msg!r}"
+        assert "max runtime of the run=NULL," in without_msg, (
+            f"expected 'max runtime of the run=NULL,' in {without_msg!r}"
         )
 
         # Effective threshold reflects the reaper math: with-override
@@ -1887,8 +1885,8 @@ class TestRequeueMigrationAppliesOnPopulatedTables:
                 session.execute(
                     text(
                         "INSERT INTO pq_tasks (name, payload, priority, status,"
-                        " run_at, client_id, attempts) VALUES (:name,"
-                        " '{}'::jsonb, 50, 'RUNNING', now(), :client_id, 1)"
+                        " run_at, started_at, client_id, attempts) VALUES (:name,"
+                        " '{}'::jsonb, 50, 'RUNNING', now(), now(), :client_id, 1)"
                     ),
                     {"name": "tests.dummy", "client_id": "before-requeue"},
                 )

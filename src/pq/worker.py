@@ -13,10 +13,12 @@ import math
 import os
 import select as select_module
 import signal
+import socket
 import sys
 import threading
 import time
 import traceback
+import warnings
 from collections.abc import Callable, Coroutine, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -34,18 +36,26 @@ from sqlalchemy import (
     Update,
     and_,
     bindparam,
-    case,
     cast,
+    delete,
+    exists,
     func,
     or_,
     select,
     update,
 )
-
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import DataError, IntegrityError, ProgrammingError
 
-from pq.client import _close_pools_before_exit
-from pq.models import Periodic, Task, TaskStatus, requeue_values
+from pq.client import _MAX_SECONDS, _close_pools_before_exit
+from pq.models import (
+    FailureKind,
+    Periodic,
+    Task,
+    TaskStatus,
+    Worker,
+    end_run_values,
+)
 from pq.registry import resolve_function_path
 from pq.serialization import deserialize
 
@@ -128,6 +138,14 @@ DEFAULT_DRAIN_TIMEOUT: float = 20.0
 # replaced or masked SIGALRM.
 KILL_GRACE_SECONDS: float = 10.0
 
+# A worker's heartbeat: every ``HEARTBEAT_INTERVAL_SECONDS`` it extends its
+# lease in ``pq_workers`` to ``WORKER_TIMEOUT_SECONDS`` from then. A worker
+# whose lease has run out counts as dead, and the tasks it was running as
+# orphaned. Each worker writes its own lease, so workers with different
+# values here can share a database.
+WORKER_TIMEOUT_SECONDS: float = 60.0
+HEARTBEAT_INTERVAL_SECONDS: float = 15.0
+
 # A periodic lock is held this much longer than the child can live, so that
 # the worker that set it is the one to release it.
 _LOCK_MARGIN_SECONDS: float = 5.0
@@ -152,13 +170,21 @@ EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 EXIT_TIMEOUT = 124  # Like GNU timeout
 
+# What the child writes to its pipe when the handler has returned, before
+# the post-execute hook runs. An error report starts with the name of an
+# exception, so the two cannot be confused.
+_HANDLER_DONE = b"\x06"
+
 
 class _ChildResult(NamedTuple):
-    """How a forked child ended."""
+    """How a run ended."""
 
-    task_status: TaskStatus
-    error_msg: str | None
-    exit_kind: str  # "success", "timeout", "oom", "killed", "shutdown", "error"
+    failure: FailureKind | None  # None: the task completed
+    error_msg: str | None = None
+
+    @property
+    def task_status(self) -> TaskStatus:
+        return TaskStatus.COMPLETED if self.failure is None else TaskStatus.FAILED
 
 
 @dataclass(frozen=True)
@@ -189,31 +215,58 @@ class _Child:
     kill_at: float  # time.monotonic() after which the worker kills it
     read_fd: int | None  # read end of the error pipe; None once closed
     output: bytearray = field(default_factory=bytearray)
-    killed: str | None = None  # why the worker killed it: "timeout", "shutdown"
+    # Why the worker killed it: TIMEOUT or SHUTDOWN. None if it did not.
+    killed: FailureKind | None = None
     # Once the pipe is gone, how long to sleep before the next look for the
     # child's exit. Doubles each time. A child closes its pipe as it exits,
     # so the first look, moments later, usually finds it gone.
     exit_poll: float = 0.00005
 
 
-class WorkerError(Exception):
+class _WorkerError(Exception):
     """Base class for worker errors."""
 
 
-class TaskTimeoutError(WorkerError):
+class _TaskTimeoutError(_WorkerError):
     """A task exceeded its max runtime."""
 
 
-class TaskOOMError(WorkerError):
+class _TaskOOMError(_WorkerError):
     """A task was killed, most likely by the OOM killer."""
 
 
-class TaskKilledError(WorkerError):
+class _TaskKilledError(_WorkerError):
     """A task was killed by a signal."""
 
 
-class TaskInterruptedError(WorkerError):
+class _TaskInterruptedError(_WorkerError):
     """A task was killed because the worker was shutting down."""
+
+
+# pq raises none of these: how a run ended is in ``Task.failure_kind``. They
+# stay importable under their old names, with a warning, until a later
+# release removes them.
+_DEPRECATED_EXCEPTIONS: dict[str, type[Exception]] = {
+    "WorkerError": _WorkerError,
+    "TaskTimeoutError": _TaskTimeoutError,
+    "TaskOOMError": _TaskOOMError,
+    "TaskKilledError": _TaskKilledError,
+    "TaskInterruptedError": _TaskInterruptedError,
+}
+for _name, _cls in _DEPRECATED_EXCEPTIONS.items():
+    _cls.__name__ = _cls.__qualname__ = _name
+
+
+def __getattr__(name: str) -> type[Exception]:
+    if name in _DEPRECATED_EXCEPTIONS:
+        warnings.warn(
+            f"pq.worker.{name} is deprecated and will be removed: pq never"
+            " raises it. How a task failed is in Task.failure_kind.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return _DEPRECATED_EXCEPTIONS[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class _MaxRuntimeExceeded(Exception):
@@ -223,36 +276,51 @@ class _MaxRuntimeExceeded(Exception):
 # The tables, for statements built without the ORM.
 _TASKS = typing_cast(Table, Task.__table__)
 _PERIODIC = typing_cast(Table, Periodic.__table__)
+_WORKERS = typing_cast(Table, Worker.__table__)
 
 
 @dataclass
 class _ShutdownState:
     """Graceful-shutdown coordination for the worker loops.
 
-    Written by the signal handler (which runs in the main thread between
-    bytecodes, so no locking is needed) and read by the worker loop and
-    ``_poll_child``. Module-level because a worker owns its process;
-    ``run_worker`` resets it on entry.
+    Written by ``request`` (from the signal handler, which runs in the main
+    thread between bytecodes, or from ``stop_worker`` in any thread; each
+    write is one attribute, so no locking is needed) and read by the worker
+    loop and ``_poll_child``. Module-level because a worker owns its
+    process; ``run_worker`` resets it on entry.
     """
 
-    signum: int | None = None  # signal that requested the shutdown
-    deadline: float | None = None  # time.monotonic() deadline, set on signal
+    requested: bool = False
+    signum: int | None = None  # the signal that asked, None for stop_worker()
+    deadline: float | None = None  # time.monotonic() deadline, set by request
     drain_timeout: float = DEFAULT_DRAIN_TIMEOUT
     logged: bool = False  # log_request() already ran for this shutdown
-    # A pipe the signal handler writes to, so that a worker loop asleep in
-    # ``_wait`` wakes up at once. Set while handlers are installed.
+    # A pipe ``request`` writes to, so that a worker loop asleep in ``_wait``
+    # wakes up at once. Set while ``run_worker`` runs.
     wake_r: int | None = None
     wake_w: int | None = None
 
-    @property
-    def requested(self) -> bool:
-        return self.signum is not None
-
     def reset(self, drain_timeout: float) -> None:
+        self.requested = False
         self.signum = None
         self.deadline = None
         self.drain_timeout = drain_timeout
         self.logged = False
+
+    def request(self, signum: int | None) -> None:
+        """Ask the worker loop to drain and stop. Never raises, never logs
+        (see ``_handle_shutdown_signal``). Later requests during the drain
+        change nothing, so they cannot abandon the remaining children."""
+        if self.requested:
+            return
+        self.deadline = time.monotonic() + self.drain_timeout
+        self.signum = signum
+        self.requested = True
+        if self.wake_w is not None:
+            try:
+                os.write(self.wake_w, b"\0")
+            except OSError:
+                pass  # the loop still notices at its next wake-up
 
     def deadline_passed(self) -> bool:
         """True once shutdown was requested and the drain budget is spent."""
@@ -270,9 +338,9 @@ class _ShutdownState:
         if not self.requested or self.logged:
             return
         self.logged = True
+        source = "stop_worker()" if self.signum is None else f"signal {self.signum}"
         logger.info(
-            f"Received signal {self.signum}, draining"
-            f" (drain_timeout={self.drain_timeout}s)..."
+            f"Received {source}, draining (drain_timeout={self.drain_timeout}s)..."
         )
 
 
@@ -287,53 +355,63 @@ def _handle_shutdown_signal(signum: int, frame: FrameType | None) -> None:
     here can deadlock: the handler runs on the main thread wherever it was
     interrupted, and loguru holds its handler locks for the whole of
     ``os.fork()``. The worker loops log the request instead
-    (``_ShutdownState.log_request``). Repeat signals during the drain are
-    ignored so they can't abandon remaining children.
+    (``_ShutdownState.log_request``).
     """
-    if _shutdown.requested:
-        return
-    _shutdown.deadline = time.monotonic() + _shutdown.drain_timeout
-    _shutdown.signum = signum
+    _shutdown.request(signum)
+
+
+def stop_worker() -> None:
+    """Ask the worker running in this process to drain and stop, the way
+    SIGTERM does: it claims nothing more, waits up to its ``drain_timeout``
+    for the tasks in flight, and ``run_worker`` returns.
+
+    Safe to call from any thread and from a signal handler. This is the
+    only way to stop a worker that runs outside the main thread, where
+    Python delivers no signals. Without a running ``run_worker`` it does
+    nothing.
+    """
+    # The pipe is open exactly while ``run_worker`` runs. A request left
+    # behind with no worker would make a later ``run_worker_once`` kill its
+    # child as soon as the drain time is up.
     if _shutdown.wake_w is not None:
-        try:
-            os.write(_shutdown.wake_w, b"\0")
-        except OSError:
-            pass  # the loop still notices at its next wake-up
+        _shutdown.request(None)
 
 
-def _install_shutdown_handlers() -> dict[int, _SignalHandler] | None:
-    """Register the drain handler for SIGTERM/SIGINT.
+def _install_shutdown_handlers() -> dict[int, _SignalHandler]:
+    """Open the wake-up pipe and register the drain handler for
+    SIGTERM/SIGINT. Returns the previous handlers, for restoration.
 
-    Returns the previous handlers (for restoration), or ``None`` when not
-    running in the main thread — ``signal.signal`` is only allowed there, so
-    in that case the worker keeps the legacy KeyboardInterrupt-only behavior.
+    ``signal.signal`` is only allowed in the main thread, and only there do
+    signals reach Python code. In any other thread no handler is installed
+    and the worker is stopped with ``stop_worker()``.
     """
-    if threading.current_thread() is not threading.main_thread():
-        logger.warning(
-            "Worker is not running in the main thread; SIGTERM graceful"
-            " shutdown is disabled (only KeyboardInterrupt is handled)."
-        )
-        return None
     _shutdown.wake_r, _shutdown.wake_w = os.pipe()
     os.set_blocking(_shutdown.wake_r, False)
     os.set_blocking(_shutdown.wake_w, False)
     previous: dict[int, _SignalHandler] = {}
+    if threading.current_thread() is not threading.main_thread():
+        logger.warning(
+            "Worker is not running in the main thread: SIGTERM and SIGINT do"
+            " not reach it. Call stop_worker() to shut it down gracefully."
+        )
+        return previous
     for signum in (signal.SIGTERM, signal.SIGINT):
         previous[signum] = signal.getsignal(signum)
         signal.signal(signum, _handle_shutdown_signal)
     return previous
 
 
-def _restore_shutdown_handlers(previous: dict[int, _SignalHandler] | None) -> None:
-    """Restore the signal handlers saved by ``_install_shutdown_handlers``."""
-    if previous is None:
-        return
+def _restore_shutdown_handlers(previous: dict[int, _SignalHandler]) -> None:
+    """Undo ``_install_shutdown_handlers``."""
     for signum, handler in previous.items():
         signal.signal(signum, handler)
-    for fd in (_shutdown.wake_r, _shutdown.wake_w):
+    wake_r, wake_w = _shutdown.wake_r, _shutdown.wake_w
+    # Unset before closing: ``stop_worker()`` in another thread must not
+    # write to a descriptor that is closed, or reused for something else.
+    _shutdown.wake_r = _shutdown.wake_w = None
+    for fd in (wake_r, wake_w):
         if fd is not None:
             os.close(fd)
-    _shutdown.wake_r = _shutdown.wake_w = None
 
 
 def _kill_child_group(child_pid: int, *, reaped: bool = False) -> None:
@@ -416,9 +494,47 @@ def _error_report(summary: str) -> str:
     )
 
 
-def _write_error(fd: int, report: str) -> None:
-    """Send the error text to the worker through the pipe (best effort)."""
-    data = report.encode("utf-8", errors="replace")
+@lru_cache(maxsize=1)
+def _prctl() -> Callable[..., int] | None:
+    """libc's ``prctl`` on Linux, else None. Looked up in the worker, once,
+    so that the child only has to call it."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import ctypes
+
+        return ctypes.CDLL(None, use_errno=True).prctl
+    except Exception:
+        return None
+
+
+_PR_SET_PDEATHSIG = 1
+
+
+def _die_with_worker(worker_pid: int) -> None:
+    """Have the kernel SIGKILL this child when its worker dies (Linux).
+
+    The child runs in its own process group, so nothing else takes it down
+    with the worker. Left running, it would finish its work while its row
+    is failed, or re-queued and run a second time, as orphaned.
+
+    The signal is sent when the thread that forked the child ends, which
+    for a worker is the thread it runs in. Processes the task itself starts
+    are not covered.
+    """
+    prctl = _prctl()
+    if prctl is None:
+        return
+    try:
+        prctl(_PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0)
+    except Exception:
+        return
+    if os.getppid() != worker_pid:
+        os._exit(EXIT_FAILURE)  # the worker died before the request took effect
+
+
+def _write_pipe(fd: int, data: bytes) -> None:
+    """Send bytes to the worker through the pipe (best effort)."""
     try:
         while data:
             data = data[os.write(fd, data) :]
@@ -435,10 +551,12 @@ def _execute_task(
     task: Task | Periodic,
     pre_execute: PreExecuteHook | None,
     post_execute: PostExecuteHook | None,
+    worker_pid: int,
 ) -> int:
     """Run the hooks and the handler in the child. Returns its exit code."""
     # Create new process group so we don't get parent's signals
     os.setpgrp()
+    _die_with_worker(worker_pid)
 
     # Restore default signal disposition: the fork inherits the parent's
     # drain handler, which in the child would silently swallow a direct
@@ -485,14 +603,21 @@ def _execute_task(
         report = _error_report(f"{type(e).__name__}: {e}")
         exit_code = EXIT_FAILURE
 
+    # The handler is done and its outcome goes to the worker now, before the
+    # hook: a hook that overruns or dies does not change what the task did.
+    # The alarm is for the handler. The hook runs until the worker's own
+    # deadline, ``KILL_GRACE_SECONDS`` after the max runtime.
+    signal.alarm(0)
+    if exit_code == EXIT_SUCCESS:
+        _write_pipe(error_write_fd, _HANDLER_DONE)
+    elif report:
+        _write_pipe(error_write_fd, report.encode("utf-8", errors="replace"))
+
     try:
         if post_execute:
             post_execute(task, error)
     except BaseException:
         pass  # Don't let hook errors mask task errors
-
-    if report:
-        _write_error(error_write_fd, report)
 
     # Hang up cleanly on any connection the task opened through pq. Not done
     # in _child_timeout_handler: a signal handler can interrupt pool code
@@ -510,6 +635,7 @@ def _run_in_child(
     task: Task | Periodic,
     pre_execute: PreExecuteHook | None,
     post_execute: PostExecuteHook | None,
+    worker_pid: int,
 ) -> NoReturn:
     """Execute handler in child process.
 
@@ -529,6 +655,7 @@ def _run_in_child(
             task,
             pre_execute,
             post_execute,
+            worker_pid,
         )
     except BaseException:
         exit_code = EXIT_FAILURE
@@ -559,6 +686,8 @@ def _fork_child(
     # The child gets a copy of what the worker has buffered, and would
     # write it a second time.
     _flush_stdio()
+    worker_pid = os.getpid()
+    _prctl()  # loaded here, so the child does not have to
     try:
         child_pid = os.fork()
     except BaseException:
@@ -586,6 +715,7 @@ def _fork_child(
             task,
             pre_execute,
             post_execute,
+            worker_pid,
         )
 
     # === PARENT PROCESS ===
@@ -634,78 +764,81 @@ def _poll_child(child: _Child) -> _ChildResult | None:
         # handler, or SIGCHLD set to be ignored).
         _close_output(child)
         return _ChildResult(
-            TaskStatus.FAILED,
+            FailureKind.ERROR,
             "Task result unknown: its process was reaped outside pq",
-            "error",
         )
 
     if pid == 0:
         if child.killed is None:
             if _shutdown.deadline_passed():
-                child.killed = "shutdown"
+                child.killed = FailureKind.SHUTDOWN
             elif time.monotonic() >= child.kill_at:
-                child.killed = "timeout"
+                child.killed = FailureKind.TIMEOUT
             if child.killed is not None:
                 _kill_child_group(child.pid)
         if child.read_fd is None:
             child.exit_poll = min(child.exit_poll * 2, _CHILD_POLL_SECONDS)
         return None
 
-    # The child wrote its error before it exited, so all of it is in the
+    # The child wrote its outcome before it exited, so all of it is in the
     # pipe now. No wait for end of file: a process the task left behind can
     # hold the pipe open for as long as it lives.
     _read_output(child)
     _close_output(child)
 
+    if os.WIFEXITED(raw_status) and os.WEXITSTATUS(raw_status) == EXIT_TIMEOUT:
+        # The child stopped itself. What it started and left running is
+        # past the deadline too.
+        _kill_child_group(child.pid, reaped=True)
+
+    if os.WIFEXITED(raw_status) and os.WEXITSTATUS(raw_status) == EXIT_SUCCESS:
+        return _ChildResult(None)
+
+    # What the child wrote is how its handler ended, and that is the result
+    # of the task. How the process ended after that, in the post-execute
+    # hook or on its way out, does not change it.
+    if child.output and not os.WIFEXITED(raw_status):
+        logger.warning(
+            f"Task '{child.claim.row.name}' had finished, but its process was"
+            " killed afterwards (post_execute overran, or a signal from"
+            f" outside; wait status {raw_status})"
+        )
+    if child.output.startswith(_HANDLER_DONE):
+        return _ChildResult(None)
+    error_msg = child.output.decode("utf-8", errors="replace").rstrip()
+    if error_msg:
+        return _ChildResult(FailureKind.ERROR, error_msg)
+
+    # Nothing written: the handler did not get to its end.
     if os.WIFSIGNALED(raw_status):
         signal_num = os.WTERMSIG(raw_status)
-        if signal_num == signal.SIGKILL and child.killed == "shutdown":
+        if signal_num == signal.SIGKILL and child.killed == FailureKind.SHUTDOWN:
             return _ChildResult(
-                TaskStatus.FAILED,
+                FailureKind.SHUTDOWN,
                 "Task interrupted by worker shutdown"
                 f" (exceeded drain_timeout={_shutdown.drain_timeout}s)",
-                "shutdown",
             )
-        if signal_num == signal.SIGKILL and child.killed == "timeout":
-            return _ChildResult(
-                TaskStatus.FAILED, "Task exceeded max runtime", "timeout"
-            )
+        if signal_num == signal.SIGKILL and child.killed == FailureKind.TIMEOUT:
+            return _ChildResult(FailureKind.TIMEOUT, "Task exceeded max runtime")
         if signal_num == signal.SIGKILL:
             max_rss_kb = rusage.ru_maxrss
             if sys.platform == "darwin":
                 max_rss_kb = max_rss_kb // 1024
             return _ChildResult(
-                TaskStatus.FAILED,
+                FailureKind.OOM,
                 f"Task killed (likely OOM). Max RSS: {max_rss_kb} KB",
-                "oom",
             )
-        return _ChildResult(
-            TaskStatus.FAILED,
-            f"Task killed by signal {signal_num}",
-            "killed",
-        )
+        return _ChildResult(FailureKind.KILLED, f"Task killed by signal {signal_num}")
 
     if os.WIFEXITED(raw_status):
         exit_code = os.WEXITSTATUS(raw_status)
-        if exit_code == EXIT_SUCCESS:
-            return _ChildResult(TaskStatus.COMPLETED, None, "success")
         if exit_code == EXIT_TIMEOUT:
-            # The child stopped itself. What it started and left running is
-            # past the deadline too.
-            _kill_child_group(child.pid, reaped=True)
-            return _ChildResult(
-                TaskStatus.FAILED, "Task exceeded max runtime", "timeout"
-            )
-        error_msg = child.output.decode("utf-8", errors="replace").rstrip()
-        if error_msg:
-            return _ChildResult(TaskStatus.FAILED, error_msg, "error")
+            return _ChildResult(FailureKind.TIMEOUT, "Task exceeded max runtime")
         return _ChildResult(
-            TaskStatus.FAILED,
-            f"Task failed with exit code {exit_code}",
-            "error",
+            FailureKind.ERROR, f"Task failed with exit code {exit_code}"
         )
 
-    return _ChildResult(TaskStatus.FAILED, "Unknown child exit status", "error")
+    return _ChildResult(FailureKind.ERROR, "Unknown child exit status")
 
 
 def _wait(children: Iterable[_Child], timeout: float) -> None:
@@ -763,6 +896,10 @@ def _claim_task_statement(
     subquery, where it would make the scan read on through the whole
     backlog when the first task does not pass. Every task after the first
     fails the check as well.
+
+    The claim also writes what the row has to say about the run while it is
+    RUNNING: who runs it (``worker_id``) and how long it may take
+    (``worker_max_runtime``, unless the task has its own cap).
     """
     tasks = _TASKS
     due = select(tasks.c.id).where(
@@ -789,6 +926,14 @@ def _claim_task_statement(
         status=TaskStatus.RUNNING,
         started_at=func.now(),
         attempts=tasks.c.attempts + 1,
+        failure_kind=None,
+        worker_id=bindparam("worker_id", type_=tasks.c.worker_id.type),
+        claimed_max_runtime_seconds=func.coalesce(
+            tasks.c.max_runtime_seconds,
+            bindparam(
+                "worker_max_runtime", type_=tasks.c.claimed_max_runtime_seconds.type
+            ),
+        ),
     ).returning(*tasks.c)
 
 
@@ -897,18 +1042,26 @@ def _claim_task(
     session: Session,
     priorities: tuple[int, ...],
     max_runtime: float,
+    worker_id: int | None,
     schedule: Row[Any] | None = None,
 ) -> _Claim | None:
     """Claim the next due one-off task. With ``schedule``, only one that
     goes before that due schedule (see ``_claim_task_statement``)."""
+    run: dict[str, object] = {
+        "worker_id": worker_id,
+        # NULL for a value the reaper could not turn into an interval. It
+        # then falls back to its own window.
+        "worker_max_runtime": max_runtime if 0 < max_runtime <= _MAX_SECONDS else None,
+    }
     if schedule is None:
         claimed = session.execute(
-            _claim_task_statement(priorities, before_schedule=False)
+            _claim_task_statement(priorities, before_schedule=False), run
         ).one_or_none()
     else:
         claimed = session.execute(
             _claim_task_statement(priorities, before_schedule=True),
             {
+                **run,
                 "schedule_priority": schedule.priority,
                 "schedule_next_run": schedule.next_run,
             },
@@ -924,7 +1077,11 @@ def _claim_task(
 
 
 def _try_claim(
-    pq: PQ, *, max_runtime: float, priorities: tuple[int, ...]
+    pq: PQ,
+    *,
+    max_runtime: float,
+    priorities: tuple[int, ...],
+    worker_id: int | None = None,
 ) -> _Claim | None:
     """Claim the next thing to run. One-off tasks and periodic schedules
     form one queue: highest priority first, and within a priority whichever
@@ -936,7 +1093,7 @@ def _try_claim(
     try:
         with pq._autocommit() as session:
             schedule = session.execute(_due_periodic_statement(priorities)).first()
-            claim = _claim_task(session, priorities, max_runtime, schedule)
+            claim = _claim_task(session, priorities, max_runtime, worker_id, schedule)
             if claim is not None or schedule is None:
                 return claim
 
@@ -952,7 +1109,7 @@ def _try_claim(
         except Exception as e:
             logger.error(f"Error claiming periodic task '{schedule.name}': {e}")
         with pq._autocommit() as session:
-            claim = _claim_task(session, priorities, max_runtime)
+            claim = _claim_task(session, priorities, max_runtime, worker_id)
         if claim is not None:
             return claim
         return _claim_periodic(
@@ -987,7 +1144,7 @@ def _try_start(
             post_execute=post_execute,
         )
     except Exception as e:
-        _record(pq, claim, _ChildResult(TaskStatus.FAILED, str(e), "error"), 0.0)
+        _record(pq, claim, _ChildResult(FailureKind.ERROR, str(e)), 0.0)
         return None
 
     os.set_blocking(read_fd, False)
@@ -1008,11 +1165,16 @@ def _try_start(
 def _finish_statement() -> Update:
     """The statement that ends a one-off run, with the run and its result as
     parameters (``run_id``, ``run_started_at``, ``result_status``,
-    ``result_error``). Built once: it is the same for every run.
+    ``result_error``, ``result_failure_kind``). Built once: it is the same
+    for every run.
 
     Each column gets one of two values, picked under the row lock that the
     ``UPDATE`` takes: the result of the run, or, if an ``upsert()`` parked a
     new version on the row meanwhile, that version as a fresh PENDING task.
+
+    A row that the orphan check failed is still this run's to close, as long
+    as nothing has re-queued it: the worker was taken for dead, and here is
+    its run reporting after all.
     """
     tasks = _TASKS
     closed = {
@@ -1022,45 +1184,43 @@ def _finish_statement() -> Update:
         ),
         "completed_at": func.now(),
         "error": bindparam("result_error", type_=tasks.c.error.type),
+        "failure_kind": bindparam(
+            "result_failure_kind", type_=tasks.c.failure_kind.type
+        ),
     }
     return (
         update(tasks)
         .where(
             tasks.c.id == bindparam("run_id"),
-            tasks.c.status == TaskStatus.RUNNING,
             tasks.c.started_at
             == bindparam("run_started_at", type_=tasks.c.started_at.type),
+            or_(
+                tasks.c.status == TaskStatus.RUNNING,
+                and_(
+                    tasks.c.status == TaskStatus.FAILED,
+                    tasks.c.failure_kind == FailureKind.WORKER_LOST,
+                ),
+            ),
         )
-        .values(
-            {
-                column: case(
-                    (tasks.c.requeue.is_(None), closed.get(column, tasks.c[column])),
-                    else_=requeued,
-                )
-                for column, requeued in requeue_values().items()
-            }
-        )
+        .values(end_run_values(closed))
         .returning(tasks.c.status)
     )
 
 
 def _write_one_off_result(
-    pq: PQ,
-    task_id: int,
-    started_at: datetime | None,
-    status: TaskStatus,
-    error_msg: str | None,
+    pq: PQ, task_id: int, started_at: datetime | None, result: _ChildResult
 ) -> TaskStatus | None:
     """End a one-off run in one statement. Returns the row's new status, or
-    None if the row was not RUNNING for this run."""
+    None if the row was not this run's to close any more."""
     with pq._autocommit() as session:
         return session.execute(
             _finish_statement(),
             {
                 "run_id": task_id,
                 "run_started_at": started_at,
-                "result_status": status,
-                "result_error": error_msg,
+                "result_status": result.task_status,
+                "result_error": result.error_msg,
+                "result_failure_kind": result.failure,
             },
         ).scalar_one_or_none()
 
@@ -1070,34 +1230,30 @@ def _finish_one_off(
     task_id: int,
     started_at: datetime | None,
     name: str,
-    status: TaskStatus,
-    error_msg: str | None,
+    result: _ChildResult,
 ) -> None:
     """Record the end of a one-off run.
 
     Only touches the row if it is still RUNNING *with this run's*
-    ``started_at`` (the value written by its claim). So a reaper's FAILED
-    verdict (or a cancel) is not overwritten, and neither is a later run
-    of the same row: if the reaper re-queued the row while this run was
-    still alive and another worker claimed it, ``started_at`` no longer
-    matches. ``None`` never matches (a RUNNING row always has
-    ``started_at``), so the row is left alone. A version that an
-    ``upsert()`` parked on the row is applied instead of closing it (see
-    ``_finish_statement``); the outcome of this run is then only in the
-    worker log.
+    ``started_at`` (the value written by its claim). So the stale reaper's
+    FAILED verdict is not overwritten, and neither is a later run of the
+    same row: if a reaper re-queued the row while this run was still alive
+    and another worker claimed it, ``started_at`` no longer matches.
+    ``None`` never matches (a RUNNING row always has ``started_at``), so
+    the row is left alone. A version that an ``upsert()`` parked on the row
+    is applied instead of closing it (see ``_finish_statement``); the
+    outcome of this run is then only in the worker log.
 
     A failed write is retried: without its result the row stays RUNNING
     until the stale reaper fails it, although the task ran to its end.
     """
-    if error_msg is not None:
+    if result.error_msg is not None:
         # Postgres does not store the NUL character in text.
-        error_msg = error_msg.replace("\x00", "\\x00")
+        result = result._replace(error_msg=result.error_msg.replace("\x00", "\\x00"))
     retry_delays = iter(_FINISH_RETRY_DELAYS)
     while True:
         try:
-            new_status = _write_one_off_result(
-                pq, task_id, started_at, status, error_msg
-            )
+            new_status = _write_one_off_result(pq, task_id, started_at, result)
             break
         except Exception as e:
             # No retry for a statement the database rejected, which it would
@@ -1117,11 +1273,11 @@ def _finish_one_off(
         logger.warning(
             f"Task '{name}' (id={task_id}) was no longer RUNNING"
             " for this run when the worker tried to record its result"
-            " — likely reaped or canceled"
+            " (likely reaped)"
         )
     elif new_status == TaskStatus.PENDING:
         logger.info(
-            f"Task '{name}' (id={task_id}) ended as {status.value};"
+            f"Task '{name}' (id={task_id}) ended as {result.task_status.value};"
             " re-queued with the version upserted while it ran"
         )
 
@@ -1149,11 +1305,11 @@ def _release_periodic_lock(pq: PQ, claim: _Claim) -> None:
         logger.error(f"Failed to clear lock for periodic task '{claim.row.name}': {e}")
 
 
-# How ``_record`` logs a periodic run that failed, by ``exit_kind``.
-_PERIODIC_FAILURE_LOG: dict[str, tuple[str, str]] = {
-    "oom": ("ERROR", "OOM"),
-    "killed": ("ERROR", "killed"),
-    "shutdown": ("WARNING", "interrupted"),
+# How ``_record`` logs a periodic run that failed: level and verb.
+_PERIODIC_FAILURE_LOG: dict[FailureKind, tuple[str, str]] = {
+    FailureKind.OOM: ("ERROR", "OOM"),
+    FailureKind.KILLED: ("ERROR", "killed"),
+    FailureKind.SHUTDOWN: ("WARNING", "interrupted"),
 }
 
 
@@ -1162,14 +1318,12 @@ def _record(pq: PQ, claim: _Claim, result: _ChildResult, elapsed: float) -> None
     name = claim.row.name
 
     if claim.is_periodic:
-        if result.exit_kind == "success":
+        if result.failure is None:
             logger.debug(f"Periodic task '{name}' completed in {elapsed:.3f} s")
-        elif result.exit_kind == "timeout":
+        elif result.failure == FailureKind.TIMEOUT:
             logger.error(f"Periodic task '{name}' timed out after {elapsed:.3f} s")
         else:
-            level, verb = _PERIODIC_FAILURE_LOG.get(
-                result.exit_kind, ("ERROR", "failed")
-            )
+            level, verb = _PERIODIC_FAILURE_LOG.get(result.failure, ("ERROR", "failed"))
             logger.log(
                 level,
                 f"Periodic task '{name}' {verb} after {elapsed:.3f} s:"
@@ -1178,18 +1332,15 @@ def _record(pq: PQ, claim: _Claim, result: _ChildResult, elapsed: float) -> None
         _release_periodic_lock(pq, claim)
         return
 
-    error_msg = result.error_msg
-    if result.exit_kind == "timeout":
-        error_msg = f"Timed out after {elapsed:.3f} s"
+    if result.failure == FailureKind.TIMEOUT:
+        result = result._replace(error_msg=f"Timed out after {elapsed:.3f} s")
 
-    _finish_one_off(
-        pq, claim.row.id, claim.started_at, name, result.task_status, error_msg
-    )
+    _finish_one_off(pq, claim.row.id, claim.started_at, name, result)
 
-    if result.task_status == TaskStatus.COMPLETED:
+    if result.failure is None:
         logger.debug(f"Task '{name}' completed in {elapsed:.3f} s")
     else:
-        logger.error(f"Task '{name}' failed after {elapsed:.3f} s: {error_msg}")
+        logger.error(f"Task '{name}' failed after {elapsed:.3f} s: {result.error_msg}")
 
 
 def _collect(pq: PQ, children: dict[int, _Child]) -> None:
@@ -1201,11 +1352,194 @@ def _collect(pq: PQ, children: dict[int, _Child]) -> None:
             _record(pq, child.claim, result, time.monotonic() - child.started)
 
 
-def _drain(pq: PQ, children: dict[int, _Child]) -> None:
-    """Wait for every child to exit and record it."""
+def _drain(
+    pq: PQ, children: dict[int, _Child], heartbeat: _Heartbeat | None = None
+) -> None:
+    """Wait for every child to exit and record it. The worker's lease is
+    kept up meanwhile: its tasks are still running."""
     while children:
+        if heartbeat is not None:
+            heartbeat.run_due(check_orphans=False)
         _wait(children.values(), _CHILD_POLL_SECONDS)
         _collect(pq, children)
+
+
+# --- In the worker: heartbeat ---
+
+
+@lru_cache(maxsize=2)
+def _heartbeat_statement(*, registered: bool) -> Any:
+    """Extend this worker's lease in ``pq_workers`` (parameters ``hostname``,
+    ``pid``, ``lease_seconds``, and ``worker_id`` once registered). Returns
+    the worker's id.
+
+    The first beat inserts the row. Later ones insert it again under the
+    same id if it is gone, so the tasks that carry the id stay valid.
+    """
+    workers = _WORKERS
+    expires_at = func.now() + func.make_interval(
+        0, 0, 0, 0, 0, 0, bindparam("lease_seconds")
+    )
+    values: dict[str, object] = {
+        "hostname": bindparam("hostname"),
+        "pid": bindparam("pid"),
+        "expires_at": expires_at,
+    }
+    if not registered:
+        return insert(workers).values(values).returning(workers.c.id)
+    values["id"] = bindparam("worker_id")
+    stmt = insert(workers).values(values)
+    return stmt.on_conflict_do_update(
+        index_elements=[workers.c.id],
+        set_={"expires_at": stmt.excluded.expires_at},
+    ).returning(workers.c.id)
+
+
+@lru_cache(maxsize=1)
+def _orphan_statement() -> Update:
+    """Fail, or re-queue from a parked version, every RUNNING task whose
+    worker is dead: its lease has run out, or its row is gone.
+
+    The error keeps the stale reaper's prefix: both mean that the task was
+    still RUNNING when nothing was running it any more.
+    """
+    tasks, workers = _TASKS, _WORKERS
+    alive = exists().where(
+        workers.c.id == tasks.c.worker_id, workers.c.expires_at > func.now()
+    )
+    closed = {
+        "status": cast(TaskStatus.FAILED.name, tasks.c.status.type),
+        "completed_at": func.now(),
+        "error": func.format(
+            "Reaped: task still RUNNING, but its worker (id=%s) stopped"
+            " sending heartbeats. Worker likely died.",
+            tasks.c.worker_id,
+        ),
+        "failure_kind": cast(FailureKind.WORKER_LOST.value, tasks.c.failure_kind.type),
+    }
+    return (
+        update(tasks)
+        .where(
+            tasks.c.status == TaskStatus.RUNNING,
+            tasks.c.worker_id.is_not(None),
+            ~alive,
+        )
+        .values(end_run_values(closed))
+        .returning(tasks.c.id, tasks.c.name, tasks.c.status)
+    )
+
+
+# Rows of dead workers are kept this long after their lease ran out, then
+# deleted. Looked for this often.
+_DEAD_WORKER_RETENTION = timedelta(hours=1)
+_PRUNE_WORKERS_INTERVAL: float = 600.0
+
+
+@dataclass
+class _Heartbeat:
+    """This worker's lease in ``pq_workers``, and the check for tasks of
+    workers whose lease has run out.
+
+    An error in either is logged and tried again at the next interval: it
+    must not stop the worker loop.
+    """
+
+    pq: PQ
+    worker_id: int | None = None  # None until the first beat got through
+    next_beat: float = 0.0  # time.monotonic()
+    last_beat: float | None = None  # when the last beat got through
+    # Since when every beat has got through, on time. The database was
+    # reachable for all of that time.
+    connected_since: float | None = None
+    next_prune: float = 0.0
+
+    def seconds_until_due(self) -> float:
+        return max(self.next_beat - time.monotonic(), 0.0)
+
+    def run_due(self, *, check_orphans: bool = True) -> None:
+        now = time.monotonic()
+        if now < self.next_beat:
+            return
+        self.next_beat = now + HEARTBEAT_INTERVAL_SECONDS
+        if not self._beat():
+            return
+        # Another worker is only called dead by a worker that has itself
+        # got every beat through for a whole lease. After an outage of the
+        # database every lease has run out, and the live workers must get
+        # to renew theirs before anyone looks.
+        connected_for = time.monotonic() - (self.connected_since or now)
+        if check_orphans and connected_for >= WORKER_TIMEOUT_SECONDS:
+            self._reap_orphans()
+
+    def _beat(self) -> bool:
+        parameters: dict[str, object] = {
+            "hostname": socket.gethostname()[:255],
+            "pid": os.getpid(),
+            "lease_seconds": WORKER_TIMEOUT_SECONDS,
+        }
+        if self.worker_id is not None:
+            parameters["worker_id"] = self.worker_id
+        try:
+            statement = _heartbeat_statement(registered=self.worker_id is not None)
+            with self.pq._autocommit() as session:
+                self.worker_id = session.execute(statement, parameters).scalar_one()
+        except Exception as e:
+            logger.error(f"Worker heartbeat failed: {e}")
+            self.connected_since = None
+            return False
+        now = time.monotonic()
+        gap = None if self.last_beat is None else now - self.last_beat
+        if gap is not None and gap > WORKER_TIMEOUT_SECONDS:
+            logger.warning(
+                f"Worker heartbeat was late: {gap:.0f} s since the last one,"
+                f" past the {WORKER_TIMEOUT_SECONDS:.0f} s after which a worker"
+                " counts as dead. Tasks it was running may have been failed"
+                " as orphaned."
+            )
+        if self.connected_since is None or (
+            gap is not None and gap > 2 * HEARTBEAT_INTERVAL_SECONDS
+        ):
+            self.connected_since = now
+        self.last_beat = now
+        return True
+
+    def _reap_orphans(self) -> None:
+        workers = _WORKERS
+        try:
+            with self.pq._autocommit() as session:
+                orphans = session.execute(_orphan_statement()).all()
+                if time.monotonic() >= self.next_prune:
+                    self.next_prune = time.monotonic() + _PRUNE_WORKERS_INTERVAL
+                    session.execute(
+                        delete(workers).where(
+                            workers.c.expires_at < func.now() - _DEAD_WORKER_RETENTION
+                        )
+                    )
+        except Exception as e:
+            logger.error(f"Error reaping tasks of dead workers: {e}")
+            return
+        for task_id, name, status in orphans:
+            if status == TaskStatus.PENDING:
+                logger.warning(
+                    f"Worker of task (id={task_id}) is gone; re-queued as"
+                    f" '{name}' by a parked upsert"
+                )
+            else:
+                logger.warning(
+                    f"Worker of task '{name}' (id={task_id}) is gone; marked FAILED"
+                )
+
+    def close(self) -> None:
+        """Delete the worker's row: it has stopped, and what is still
+        RUNNING under its id is orphaned from now on."""
+        if self.worker_id is None:
+            return
+        workers = _WORKERS
+        try:
+            with self.pq._autocommit() as session:
+                session.execute(delete(workers).where(workers.c.id == self.worker_id))
+        except Exception as e:
+            logger.error(f"Failed to remove the worker's heartbeat row: {e}")
 
 
 # --- In the worker: maintenance ---
@@ -1216,9 +1550,10 @@ def _effective_stale_timeout(
 ) -> timedelta | None:
     """The stale-reaper window, raised to twice the worker's max runtime.
 
-    A shorter window fails tasks that are still running. Twice is the rule
-    the reaper applies to a task with its own ``max_runtime_seconds``. For a
-    very short max runtime the floor is the time a child can be alive.
+    Twice the max runtime of its run is what the reaper gives every row
+    whose claim recorded one. The floor here covers the rows that have
+    none, claimed by a version of pq that did not record it. For a very
+    short max runtime the floor is the time a child can be alive.
     """
     if stale_task_timeout is None:
         return None
@@ -1310,9 +1645,22 @@ def run_worker(
     still-running task children and marks their rows FAILED with an explicit
     shutdown error. Interrupted tasks are NOT re-queued — pq's at-most-once
     semantics are preserved; applications that need redelivery must
-    re-enqueue such tasks themselves. The one exception: if an ``upsert()``
-    stored a new version on the row while it ran, the row is re-queued with
-    that new version (the interrupted run itself is not retried).
+    re-enqueue such tasks themselves, and find them by
+    ``Task.failure_kind == FailureKind.SHUTDOWN``. The one exception: if an
+    ``upsert()`` stored a new version on the row while it ran, the row is
+    re-queued with that new version (the interrupted run itself is not
+    retried). Outside the main thread no signal reaches the worker:
+    ``stop_worker()`` starts the same shutdown from code.
+
+    While it runs, the worker keeps a row in ``pq_workers`` and extends its
+    lease there every ``HEARTBEAT_INTERVAL_SECONDS``. Tasks of a worker
+    whose lease has run out (``WORKER_TIMEOUT_SECONDS`` without a heartbeat)
+    are failed with ``FailureKind.WORKER_LOST`` by any other worker, or
+    re-queued if an ``upsert()`` parked a version on them. On Linux the
+    kernel kills a task's process when its worker dies, so such a task is
+    not running any more. A worker that is alive but cannot reach the
+    database for that long is taken for dead as well: its tasks are failed
+    while they run, and a result they still report replaces that verdict.
 
     Args:
         pq: PQ client instance.
@@ -1330,11 +1678,12 @@ def run_worker(
         cleanup_interval: Seconds between cleanup runs. Default: 3600 (1 hour).
         stale_task_timeout: Mark RUNNING tasks older than this as FAILED
             (or re-queue them, if an upsert parked a new version on them).
-            Catches orphaned tasks whose worker died mid-execution.
-            Default: 1 hour. Set to ``None`` to disable. Must be longer
-            than the longest run: a live run that is reaped can overlap
-            with the version re-queued after it. A value below twice
-            ``max_runtime`` is raised to that.
+            Catches what the heartbeat does not: a row left RUNNING by
+            ``run_worker_once``, or by a run whose result could not be
+            written. Default: 1 hour. Set to ``None`` to disable. A row
+            gets at least twice the max runtime of its run (see
+            ``PQ.reap_stale_tasks``), and a value below twice this
+            worker's ``max_runtime`` is raised to that.
         drain_timeout: Seconds to wait for in-flight tasks when shutting
             down on SIGTERM/SIGINT. Default: 20. Must be set below the
             orchestrator's termination grace period, with headroom for the
@@ -1403,6 +1752,16 @@ def run_worker_once(
     One-off tasks and periodic schedules form one queue: highest priority
     first, and within a priority whichever came due first.
 
+    This is one claim and one run, without what ``run_worker`` does around
+    them:
+
+    - No heartbeat, no cleanup and no stale reaper. A row left RUNNING (the
+      process died during the run) stays RUNNING, and a version parked on
+      it does not run, until something calls ``PQ.reap_stale_tasks``. A
+      program that loops over this function calls it itself.
+    - No signal handling. A SIGTERM during the call ends the process by
+      default and leaves the row RUNNING.
+
     Args:
         pq: PQ client instance.
         max_runtime: Maximum execution time per task in seconds. Default: 30 min.
@@ -1460,14 +1819,22 @@ def _run_concurrent(
     children: dict[int, _Child] = {}  # pid -> child
     priority_values = _priority_values(priorities)
     maintenance = _Maintenance(pq, retention_days, cleanup_interval, stale_task_timeout)
+    heartbeat = _Heartbeat(pq)
 
     try:
         try:
             while not _shutdown.requested:
+                # Before the claims: a worker whose lease has run out must
+                # not claim under it.
+                heartbeat.run_due()
+
                 # Fill empty slots with new tasks
                 while len(children) < concurrency and not _shutdown.requested:
                     claim = _try_claim(
-                        pq, max_runtime=max_runtime, priorities=priority_values
+                        pq,
+                        max_runtime=max_runtime,
+                        priorities=priority_values,
+                        worker_id=heartbeat.worker_id,
                     )
                     if claim is None:
                         break
@@ -1484,12 +1851,15 @@ def _run_concurrent(
                 has_free_slot = len(children) < concurrency
                 _wait(
                     children.values(),
-                    poll_interval if has_free_slot else _CHILD_POLL_SECONDS,
+                    min(
+                        poll_interval if has_free_slot else _CHILD_POLL_SECONDS,
+                        heartbeat.seconds_until_due(),
+                    ),
                 )
                 _collect(pq, children)
         except KeyboardInterrupt:
-            # Fallback for non-main-thread workers (no handlers installed);
-            # the drain below still runs, just without a deadline.
+            # Raised by something other than SIGINT, which the worker's
+            # handler takes. The drain below still runs, without a deadline.
             pass
         _shutdown.log_request()
     finally:
@@ -1500,5 +1870,6 @@ def _run_concurrent(
         # shutdown error.
         if children:
             logger.info(f"Shutting down, draining {len(children)} in-flight task(s)...")
-            _drain(pq, children)
+            _drain(pq, children, heartbeat)
+        heartbeat.close()
     logger.info("Worker stopped.")
