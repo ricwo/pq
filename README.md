@@ -215,6 +215,8 @@ pq.stop_worker()
 thread.join()
 ```
 
+`stop_worker()` also works before the worker has got going: the next `run_worker` in the process then stops as soon as it starts.
+
 ### Failed tasks
 
 A failed task has `status == TaskStatus.FAILED`, the text of the failure in `error`, and its cause in `failure_kind`:

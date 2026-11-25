@@ -663,19 +663,37 @@ class TestStopWorker:
         assert _task(pq, task_id).status == TaskStatus.COMPLETED
         assert any("stop_worker()" in r["message"] for r in log_records)
 
-    def test_stop_worker_without_a_worker_does_nothing(
+    def test_stop_before_the_worker_has_started_is_not_lost(self, pq: PQ) -> None:
+        """A ``stop_worker()`` that came before ``run_worker`` had opened
+        its wake-up pipe was dropped, and the thread ran for ever."""
+        for _ in range(20):
+            thread = threading.Thread(
+                target=lambda: pq.run_worker(poll_interval=0.05), daemon=True
+            )
+            thread.start()
+            pq.stop_worker()
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+
+    def test_stop_with_no_worker_stops_the_next_one_and_only_that(
         self, pq: PQ, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A request with no worker to take it must not linger: it would
-        make the next ``run_worker_once`` kill its task as a shutdown."""
         monkeypatch.setattr(worker._shutdown, "drain_timeout", 0.0)
         pq.stop_worker()
         time.sleep(0.05)
+
+        # ``run_worker_once`` is not a worker to stop: a request that
+        # reached it would make it kill its task as a shutdown.
         once = pq.enqueue(sleep_for, 0.3)
         pq.run_worker_once()
         assert _task(pq, once).status == TaskStatus.COMPLETED
 
+        # The next ``run_worker`` returns at once and claims nothing.
         task_id = pq.enqueue(noop)
+        worker.run_worker(pq, poll_interval=0.05)
+        assert _task(pq, task_id).status == TaskStatus.PENDING
+
+        # The one after that runs as usual.
         with _sigterm_self_after(1.0):
             worker.run_worker(pq, poll_interval=0.05)
         assert _task(pq, task_id).status == TaskStatus.COMPLETED

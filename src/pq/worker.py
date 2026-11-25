@@ -291,6 +291,8 @@ class _ShutdownState:
     """
 
     signum: int | None = None  # the signal that asked, None for stop_worker()
+    # ``stop_worker()`` was called and no ``run_worker`` has acted on it yet.
+    stop_pending: bool = False
     deadline: float | None = None  # time.monotonic() deadline, set by request
     drain_timeout: float = DEFAULT_DRAIN_TIMEOUT
     logged: bool = False  # log_request() already ran for this shutdown
@@ -367,12 +369,19 @@ def stop_worker() -> None:
 
     Safe to call from any thread and from a signal handler. This is the
     only way to stop a worker that runs outside the main thread, where
-    Python delivers no signals. Without a running ``run_worker`` it does
-    nothing.
+    Python delivers no signals.
+
+    If no worker is running yet, the next ``run_worker`` in this process
+    stops as soon as it starts. So a worker thread can be stopped right
+    after ``thread.start()``, before it has got going.
+    ``run_worker_once`` is not affected.
     """
-    # The pipe is open exactly while ``run_worker`` runs. A request left
-    # behind with no worker would make a later ``run_worker_once`` kill its
-    # child as soon as the drain time is up.
+    # Noted first, for a ``run_worker`` that is still starting up: it opens
+    # its pipe and then looks at this flag, so one of the two sees the other.
+    _shutdown.stop_pending = True
+    # The pipe is open exactly while ``run_worker`` runs. A request made
+    # with no worker would make a later ``run_worker_once`` kill its child
+    # as soon as the drain time is up.
     if _shutdown.wake_w is not None:
         _shutdown.request(None)
 
@@ -1743,6 +1752,8 @@ def run_worker(
     _shutdown.reset(drain_timeout)
     previous_handlers = _install_shutdown_handlers()
     try:
+        if _shutdown.stop_pending:
+            _shutdown.request(None)  # stop_worker() came before the pipe was open
         _run_concurrent(
             pq,
             concurrency=max(concurrency, 1),
@@ -1761,6 +1772,7 @@ def run_worker(
         # later run_worker_once calls in this process kill their children
         # as soon as they look at them.
         _shutdown.reset(drain_timeout)
+        _shutdown.stop_pending = False
 
 
 def run_worker_once(
