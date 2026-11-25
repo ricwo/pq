@@ -28,7 +28,6 @@ from typing import cast as typing_cast
 from croniter import croniter
 from loguru import logger
 from sqlalchemy import (
-    ColumnElement,
     Row,
     Select,
     Table,
@@ -52,6 +51,8 @@ from pq.serialization import deserialize
 
 if TYPE_CHECKING:
     from collections.abc import Set
+
+    from sqlalchemy.orm import Session
 
     from pq.client import PQ
     from pq.priority import Priority
@@ -745,23 +746,6 @@ def _priority_values(priorities: Set[Priority] | None) -> tuple[int, ...]:
     return tuple(sorted(int(p) for p in priorities)) if priorities else ()
 
 
-def _due_periodic(priorities: tuple[int, ...]) -> list[ColumnElement[bool]]:
-    """Conditions for a periodic schedule that is due and not locked."""
-    periodic = _PERIODIC
-    conditions: list[ColumnElement[bool]] = [
-        periodic.c.active.is_(True),
-        periodic.c.next_run <= func.now(),
-        or_(
-            periodic.c.max_concurrent.is_(None),
-            periodic.c.locked_until.is_(None),
-            periodic.c.locked_until <= func.now(),
-        ),
-    ]
-    if priorities:
-        conditions.append(periodic.c.priority.in_(priorities))
-    return conditions
-
-
 @lru_cache(maxsize=64)
 def _claim_task_statement(
     priorities: tuple[int, ...], *, before_schedule: bool
@@ -812,12 +796,18 @@ def _claim_task_statement(
 def _due_periodic_statement(priorities: tuple[int, ...]) -> Select[Any]:
     """The due periodic schedules that are not locked, best first."""
     periodic = _PERIODIC
-    return (
-        select(periodic)
-        .where(*_due_periodic(priorities))
-        .order_by(periodic.c.priority.desc(), periodic.c.next_run)
-        .limit(1)
+    due = select(periodic).where(
+        periodic.c.active.is_(True),
+        periodic.c.next_run <= func.now(),
+        or_(
+            periodic.c.max_concurrent.is_(None),
+            periodic.c.locked_until.is_(None),
+            periodic.c.locked_until <= func.now(),
+        ),
     )
+    if priorities:
+        due = due.where(periodic.c.priority.in_(priorities))
+    return due.order_by(periodic.c.priority.desc(), periodic.c.next_run).limit(1)
 
 
 def _next_cron_run(cron_expr: str, database_now: datetime) -> datetime:
@@ -831,6 +821,11 @@ def _next_cron_run(cron_expr: str, database_now: datetime) -> datetime:
     # In UTC: croniter reads the expression in the time zone of its base,
     # and the database returns times in the session's time zone.
     return croniter(cron_expr, database_now.astimezone(UTC)).get_next(datetime)
+
+
+def _effective_max_runtime(own: float | None, default: float) -> float:
+    """A row's own ``max_runtime_seconds`` when set, otherwise the worker's."""
+    return own if own is not None else default
 
 
 def _lock_seconds(max_runtime: float) -> float:
@@ -870,13 +865,10 @@ def _claim_periodic(
         if due is None:
             return None
 
-        # The schedule's own cap when set, otherwise the worker's default.
-        # It sets the child's timeout and the lock window, so the lock does
-        # not expire while a long run is still going.
-        effective_max_runtime = (
-            due.max_runtime_seconds
-            if due.max_runtime_seconds is not None
-            else max_runtime
+        # Sets the child's timeout and the lock window, so the lock does not
+        # expire while a long run is still going.
+        effective_max_runtime = _effective_max_runtime(
+            due.max_runtime_seconds, max_runtime
         )
         values: dict[str, object] = {"last_run": func.now()}
         if due.max_concurrent is not None:
@@ -901,15 +893,32 @@ def _claim_periodic(
     )
 
 
-def _claimed_task(claimed: Row[Any], max_runtime: float) -> _Claim:
+def _claim_task(
+    session: Session,
+    priorities: tuple[int, ...],
+    max_runtime: float,
+    schedule: Row[Any] | None = None,
+) -> _Claim | None:
+    """Claim the next due one-off task. With ``schedule``, only one that
+    goes before that due schedule (see ``_claim_task_statement``)."""
+    if schedule is None:
+        claimed = session.execute(
+            _claim_task_statement(priorities, before_schedule=False)
+        ).one_or_none()
+    else:
+        claimed = session.execute(
+            _claim_task_statement(priorities, before_schedule=True),
+            {
+                "schedule_priority": schedule.priority,
+                "schedule_next_run": schedule.next_run,
+            },
+        ).one_or_none()
+    if claimed is None:
+        return None
     task = Task(**claimed._mapping)
     return _Claim(
         row=task,
-        max_runtime=(
-            task.max_runtime_seconds
-            if task.max_runtime_seconds is not None
-            else max_runtime
-        ),
+        max_runtime=_effective_max_runtime(task.max_runtime_seconds, max_runtime),
         started_at=task.started_at,
     )
 
@@ -921,55 +930,31 @@ def _try_claim(
     form one queue: highest priority first, and within a priority whichever
     came due first.
 
-    One-off tasks used to go first whatever their priority, so while any
-    was due no schedule ran: a backlog held every schedule up until it was
-    worked off. In one queue a schedule waits no longer than a task of its
-    priority that came due at the same time, and a schedule that is due
-    again as soon as it has run does not hold up the tasks either.
-
     A poll costs two statements on one connection when no schedule is due:
     the read of the schedules and the claim of a task.
     """
     try:
         with pq._autocommit() as session:
             schedule = session.execute(_due_periodic_statement(priorities)).first()
-            if schedule is None:
-                claimed = session.execute(
-                    _claim_task_statement(priorities, before_schedule=False)
-                ).one_or_none()
-                return None if claimed is None else _claimed_task(claimed, max_runtime)
+            claim = _claim_task(session, priorities, max_runtime, schedule)
+            if claim is not None or schedule is None:
+                return claim
 
-            claimed = session.execute(
-                _claim_task_statement(priorities, before_schedule=True),
-                {
-                    "schedule_priority": schedule.priority,
-                    "schedule_next_run": schedule.next_run,
-                },
-            ).one_or_none()
-            if claimed is not None:
-                return _claimed_task(claimed, max_runtime)
-    except Exception as e:
-        logger.error(f"Error claiming task: {e}")
-        return None
-
-    # The schedule is next. If it cannot be claimed (another worker is
-    # claiming it, or its claim fails), what is behind it does not wait for
-    # it: a task first, else another schedule.
-    try:
-        claim = _claim_periodic(
-            pq, max_runtime=max_runtime, priorities=priorities, only=schedule.id
-        )
+        # The schedule is next. If it cannot be claimed (another worker is
+        # claiming it, or its claim fails), what is behind it does not wait
+        # for it: a task first, else another schedule.
+        try:
+            claim = _claim_periodic(
+                pq, max_runtime=max_runtime, priorities=priorities, only=schedule.id
+            )
+            if claim is not None:
+                return claim
+        except Exception as e:
+            logger.error(f"Error claiming periodic task '{schedule.name}': {e}")
+        with pq._autocommit() as session:
+            claim = _claim_task(session, priorities, max_runtime)
         if claim is not None:
             return claim
-    except Exception as e:
-        logger.error(f"Error claiming periodic task '{schedule.name}': {e}")
-    try:
-        with pq._autocommit() as session:
-            claimed = session.execute(
-                _claim_task_statement(priorities, before_schedule=False)
-            ).one_or_none()
-        if claimed is not None:
-            return _claimed_task(claimed, max_runtime)
         return _claim_periodic(
             pq, max_runtime=max_runtime, priorities=priorities, skip=schedule.id
         )
@@ -1096,16 +1081,10 @@ def _finish_one_off(
     of the same row: if the reaper re-queued the row while this run was
     still alive and another worker claimed it, ``started_at`` no longer
     matches. ``None`` never matches (a RUNNING row always has
-    ``started_at``), so the row is left alone. If an ``upsert()`` parked a
-    new version on the row while it ran (``Task.requeue``), the row is
-    re-queued as PENDING with that version instead of being closed. The
-    outcome of this run is then only in the worker log, the same as when
-    an upsert overwrites a COMPLETED or FAILED row.
-
-    The write is one ``UPDATE``, so it serializes with a concurrent
-    ``upsert()``, whose ``ON CONFLICT DO UPDATE`` locks the same row: a
-    parked version is either seen here, or the upsert runs after this
-    statement and hits a non-RUNNING row, which it overwrites directly.
+    ``started_at``), so the row is left alone. A version that an
+    ``upsert()`` parked on the row is applied instead of closing it (see
+    ``_finish_statement``); the outcome of this run is then only in the
+    worker log.
 
     A failed write is retried: without its result the row stays RUNNING
     until the stale reaper fails it, although the task ran to its end.
@@ -1170,6 +1149,14 @@ def _release_periodic_lock(pq: PQ, claim: _Claim) -> None:
         logger.error(f"Failed to clear lock for periodic task '{claim.row.name}': {e}")
 
 
+# How ``_record`` logs a periodic run that failed, by ``exit_kind``.
+_PERIODIC_FAILURE_LOG: dict[str, tuple[str, str]] = {
+    "oom": ("ERROR", "OOM"),
+    "killed": ("ERROR", "killed"),
+    "shutdown": ("WARNING", "interrupted"),
+}
+
+
 def _record(pq: PQ, claim: _Claim, result: _ChildResult, elapsed: float) -> None:
     """Log how a run ended and write it to the database."""
     name = claim.row.name
@@ -1179,24 +1166,14 @@ def _record(pq: PQ, claim: _Claim, result: _ChildResult, elapsed: float) -> None
             logger.debug(f"Periodic task '{name}' completed in {elapsed:.3f} s")
         elif result.exit_kind == "timeout":
             logger.error(f"Periodic task '{name}' timed out after {elapsed:.3f} s")
-        elif result.exit_kind == "oom":
-            logger.error(
-                f"Periodic task '{name}' OOM after {elapsed:.3f} s: {result.error_msg}"
-            )
-        elif result.exit_kind == "killed":
-            logger.error(
-                f"Periodic task '{name}' killed after {elapsed:.3f} s:"
-                f" {result.error_msg}"
-            )
-        elif result.exit_kind == "shutdown":
-            logger.warning(
-                f"Periodic task '{name}' interrupted after {elapsed:.3f} s:"
-                f" {result.error_msg}"
-            )
         else:
-            logger.error(
-                f"Periodic task '{name}' failed after {elapsed:.3f} s:"
-                f" {result.error_msg}"
+            level, verb = _PERIODIC_FAILURE_LOG.get(
+                result.exit_kind, ("ERROR", "failed")
+            )
+            logger.log(
+                level,
+                f"Periodic task '{name}' {verb} after {elapsed:.3f} s:"
+                f" {result.error_msg}",
             )
         _release_periodic_lock(pq, claim)
         return
@@ -1222,6 +1199,13 @@ def _collect(pq: PQ, children: dict[int, _Child]) -> None:
         if result is not None:
             del children[child.pid]
             _record(pq, child.claim, result, time.monotonic() - child.started)
+
+
+def _drain(pq: PQ, children: dict[int, _Child]) -> None:
+    """Wait for every child to exit and record it."""
+    while children:
+        _wait(children.values(), _CHILD_POLL_SECONDS)
+        _collect(pq, children)
 
 
 # --- In the worker: maintenance ---
@@ -1438,10 +1422,7 @@ def run_worker_once(
         return False
     child = _try_start(pq, claim, pre_execute, post_execute)
     if child is not None:
-        children = {child.pid: child}
-        while children:
-            _wait(children.values(), _CHILD_POLL_SECONDS)
-            _collect(pq, children)
+        _drain(pq, {child.pid: child})
     return True
 
 
@@ -1519,7 +1500,5 @@ def _run_concurrent(
         # shutdown error.
         if children:
             logger.info(f"Shutting down, draining {len(children)} in-flight task(s)...")
-            while children:
-                _wait(children.values(), _CHILD_POLL_SECONDS)
-                _collect(pq, children)
+            _drain(pq, children)
     logger.info("Worker stopped.")

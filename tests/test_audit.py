@@ -214,6 +214,12 @@ def _task(pq: PQ, task_id: int) -> Task:
     return task
 
 
+def _next_run(pq: PQ) -> datetime:
+    """The ``next_run`` of the only schedule."""
+    with pq.session() as session:
+        return session.execute(select(Periodic.next_run)).scalar_one()
+
+
 def _is_gone(pid: int) -> bool:
     """True if the process has exited (a zombie counts: it only awaits its
     parent's ``wait``)."""
@@ -552,25 +558,21 @@ class TestPeriodic:
         every deploy, once per restarted worker."""
         pq.schedule(noop, run_every=timedelta(days=1))
         pq.run_worker_once()
-        with pq.session() as session:
-            advanced = session.execute(select(Periodic.next_run)).scalar_one()
+        advanced = _next_run(pq)
         assert advanced > datetime.now(UTC) + timedelta(hours=23)
 
         pq.schedule(noop, run_every=timedelta(days=1))
-        with pq.session() as session:
-            assert session.execute(select(Periodic.next_run)).scalar_one() == advanced
+        assert _next_run(pq) == advanced
 
     def test_reschedule_with_new_timing_resets_next_run(self, pq: PQ) -> None:
         pq.schedule(noop, run_every=timedelta(days=1))
         pq.run_worker_once()
         pq.schedule(noop, run_every=timedelta(hours=1))
-        with pq.session() as session:
-            next_run = session.execute(select(Periodic.next_run)).scalar_one()
+        next_run = _next_run(pq)
         assert next_run <= datetime.now(UTC)
 
         pq.schedule(noop, cron="0 0 1 1 *")
-        with pq.session() as session:
-            next_run = session.execute(select(Periodic.next_run)).scalar_one()
+        next_run = _next_run(pq)
         assert next_run > datetime.now(UTC) + timedelta(days=1)
 
     def test_cron_does_not_fire_twice_when_worker_clock_is_behind(
@@ -592,8 +594,7 @@ class TestPeriodic:
         monkeypatch.setattr(worker, "datetime", BehindClock)
         pq.run_worker_once()
         monkeypatch.undo()
-        with pq.session() as session:
-            next_run = session.execute(select(Periodic.next_run)).scalar_one()
+        next_run = _next_run(pq)
         assert next_run > fired
 
     def test_cron_is_read_in_utc_whatever_the_session_time_zone(
@@ -618,8 +619,7 @@ class TestPeriodic:
         with PQ(db_url + "&options=-c%20timezone%3DEurope/Berlin") as berlin:
             berlin.run_worker_once()
         monkeypatch.undo()
-        with pq.session() as session:
-            next_run = session.execute(select(Periodic.next_run)).scalar_one()
+        next_run = _next_run(pq)
         assert next_run == fired + timedelta(days=1)
 
     def test_reactivated_schedule_gets_a_fresh_next_run(self, pq: PQ) -> None:
@@ -629,8 +629,7 @@ class TestPeriodic:
                 update(Periodic).values(next_run=datetime.now(UTC) - timedelta(days=30))
             )
         pq.schedule(noop, cron="0 0 1 1 *", active=True)
-        with pq.session() as session:
-            next_run = session.execute(select(Periodic.next_run)).scalar_one()
+        next_run = _next_run(pq)
         assert next_run > datetime.now(UTC)
 
     def test_tasks_and_schedules_run_in_one_order(self, pq: PQ, tmp_path: Path) -> None:

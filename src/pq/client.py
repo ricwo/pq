@@ -152,18 +152,40 @@ class Upsert:
     max_runtime_seconds: float | None = None
 
 
+def _task_row(
+    task: Callable[..., object],
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+    *,
+    client_id: str | None,
+    run_at: datetime | None,
+    priority: Priority,
+    max_runtime_seconds: float | None,
+) -> dict[str, object]:
+    """Check a new task and turn it into its ``pq_tasks`` row."""
+    _validate_max_runtime(max_runtime_seconds)
+    return {
+        "client_id": client_id,
+        "name": get_function_path(task),
+        "payload": serialize(args, kwargs),
+        "priority": int(priority),
+        "status": TaskStatus.PENDING,
+        "run_at": datetime.now(UTC) if run_at is None else run_at,
+        "max_runtime_seconds": max_runtime_seconds,
+    }
+
+
 def _upsert_row(u: Upsert) -> dict[str, object]:
     """Check one item and turn it into the row ``_upsert_statement`` inserts."""
-    _validate_max_runtime(u.max_runtime_seconds)
-    return {
-        "client_id": u.client_id,
-        "name": get_function_path(u.task),
-        "payload": serialize(u.args, u.kwargs),
-        "priority": int(u.priority),
-        "status": TaskStatus.PENDING,
-        "run_at": datetime.now(UTC) if u.run_at is None else u.run_at,
-        "max_runtime_seconds": u.max_runtime_seconds,
-    }
+    return _task_row(
+        u.task,
+        u.args,
+        u.kwargs,
+        client_id=u.client_id,
+        run_at=u.run_at,
+        priority=u.priority,
+        max_runtime_seconds=u.max_runtime_seconds,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -389,25 +411,16 @@ class PQ:
                 or if ``max_runtime_seconds`` is not None and ``<= 0``.
             IntegrityError: If client_id already exists.
         """
-        _validate_max_runtime(max_runtime_seconds)
-        name = get_function_path(task)
-        payload = serialize(args, kwargs)
-
-        if run_at is None:
-            run_at = datetime.now(UTC)
-
-        stmt = (
-            insert(Task)
-            .values(
-                name=name,
-                payload=payload,
-                run_at=run_at,
-                priority=int(priority),
-                client_id=client_id,
-                max_runtime_seconds=max_runtime_seconds,
-            )
-            .returning(Task.id)
+        row = _task_row(
+            task,
+            args,
+            kwargs,
+            client_id=client_id,
+            run_at=run_at,
+            priority=priority,
+            max_runtime_seconds=max_runtime_seconds,
         )
+        stmt = insert(Task).values(row).returning(Task.id)
         with self._autocommit() as session:
             return session.execute(stmt).scalar_one()
 
