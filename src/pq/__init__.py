@@ -7,7 +7,7 @@ from pq.models import FailureKind, Periodic, Task, TaskStatus
 from pq.priority import Priority
 from pq.worker import PostExecuteHook, PreExecuteHook
 
-__version__ = "0.9.2"
+__version__ = "0.10.0"
 
 __all__ = [
     "PQ",
